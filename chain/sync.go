@@ -407,6 +407,40 @@ func (s *Syncer) getHeaders(ctx context.Context) error {
 	return nil
 }
 
+// rescanner is the part of the node RPC client used by fetchMissingRelevantTxs.
+type rescanner interface {
+	Rescan(ctx context.Context, blocks []chainhash.Hash, save func(block *chainhash.Hash, txs []*wire.MsgTx) error) error
+}
+
+// fetchMissingRelevantTxs asks mond for the relevant transactions of every
+// chain block that has no relevantTxs entry.  Such blocks reached the sidechain
+// forest without a blockconnected notification: headers fetched by getHeaders
+// (e.g. after a restart) or blocks reorged out of the main chain.  ChainSwitch
+// would connect them without their transactions and advance the processed
+// transactions marker past them, losing those transactions for good.
+func fetchMissingRelevantTxs(ctx context.Context, r rescanner, chain []*wallet.BlockNode,
+	relevantTxs map[chainhash.Hash][]*wire.MsgTx) error {
+
+	// mond rejects a rescan whose blocks do not form a chain, so rescan
+	// everything from the first block without an entry.
+	var rescan []chainhash.Hash
+	for _, n := range chain {
+		if _, ok := relevantTxs[*n.Hash]; !ok || len(rescan) != 0 {
+			rescan = append(rescan, *n.Hash)
+		}
+	}
+	if len(rescan) == 0 {
+		return nil
+	}
+	// mond reports only the blocks that hold relevant transactions.
+	return r.Rescan(ctx, rescan, func(block *chainhash.Hash, txs []*wire.MsgTx) error {
+		if _, ok := relevantTxs[*block]; !ok {
+			relevantTxs[*block] = txs
+		}
+		return nil
+	})
+}
+
 // getMissingHeaders fetches missing headers one by one from mond. This assumes
 // that the initial header sync and rescan have been performed and that mond's
 // data filter (for block rescans) has been loaded.
@@ -893,6 +927,10 @@ func (s *Syncer) handleBlockConnected(ctx context.Context, header *wire.BlockHea
 		return err
 	}
 	if len(bestChain) != 0 {
+		err = fetchMissingRelevantTxs(ctx, s.rpc, bestChain, s.relevantTxs)
+		if err != nil {
+			return err
+		}
 		var prevChain []*wallet.BlockNode
 		prevChain, err = s.wallet.ChainSwitch(ctx, &s.sidechains, bestChain, s.relevantTxs)
 		if err != nil {
@@ -903,12 +941,10 @@ func (s *Syncer) handleBlockConnected(ctx context.Context, header *wire.BlockHea
 			log.Infof("Reorganize from %v to %v (total %d block(s) reorged)",
 				prevChain[len(prevChain)-1].Hash, bestChain[len(bestChain)-1].Hash, len(prevChain))
 			for _, n := range prevChain {
+				// The removed blocks have no relevantTxs entry;
+				// fetchMissingRelevantTxs refetches them if a reorg
+				// switches back to this older chain.
 				s.sidechains.AddBlockNode(n)
-
-				// TODO: should add txs from the removed blocks
-				// to relevantTxs.  Later block connected logs
-				// will be missing the transaction counts if a
-				// reorg switches back to this older chain.
 			}
 		}
 		for _, n := range bestChain {
