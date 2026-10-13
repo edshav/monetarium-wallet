@@ -3718,6 +3718,10 @@ func (s *Store) MakeInputSourceWithCoinType(dbtx walletdb.ReadTx, account uint32
 							if _, ok := seen[string(k)]; ok {
 								return nil
 							}
+							if existsRawUnminedInput(ns, k) != nil {
+								// Output is spent by an unmined transaction.
+								return nil
+							}
 							// Skip unmined outputs from unpublished transactions.
 							if txHash := k[:32]; existsUnpublished(ns, txHash) {
 								return nil
