@@ -394,7 +394,6 @@ func (c *VSPClient) setVoteChoices(ctx context.Context, ticket *VSPTicket,
 
 func (fp *vspFeePayment) reconcilePayment() error {
 	ctx := fp.ctx
-	w := fp.client.wallet
 
 	// stop processing if ticket is expired or spent
 	// TODO: if the ticket is no longer saved by the wallet (tx expired,
@@ -464,14 +463,8 @@ func (fp *vspFeePayment) reconcilePayment() error {
 	if errors.As(err, &apiErr) {
 		switch apiErr.Code {
 		case types.ErrFeeAlreadyReceived:
-			err = w.SetPublished(ctx, &feeHash, true)
-			if err != nil {
-				return err
-			}
-			err = fp.ticket.UpdateFeePaid(ctx, feeHash, fp.client.URL, fp.client.PubKey)
-			if err != nil {
-				return err
-			}
+			// The VSP may still be holding the fee tx unbroadcast, so it
+			// stays unpublished until confirmPayment sees it broadcast.
 			err = nil
 		case types.ErrInvalidFeeTx, types.ErrCannotBroadcastFee:
 			err := fp.ticket.UpdateFeeErrored(ctx, fp.client.URL, fp.client.PubKey)
@@ -604,6 +597,10 @@ func (fp *vspFeePayment) confirmPayment() (err error) {
 		return nil
 	}
 
+	fp.mu.Lock()
+	feeHash := fp.feeHash
+	fp.mu.Unlock()
+
 	switch status.FeeTxStatus {
 	case "received":
 		// VSP has received the fee tx but has not yet broadcast it.
@@ -612,15 +609,20 @@ func (fp *vspFeePayment) confirmPayment() (err error) {
 		return nil
 	case "broadcast":
 		fp.client.log.Infof("VSP has successfully sent the fee tx for %v", fp.ticket)
-		// Broadcasted, but not confirmed.
+		// Broadcasted, but not confirmed.  The network knows the fee tx
+		// now, so its change may be spent before it is mined.  A fee tx
+		// other than the VSP's stays unpublished.
+		if status.FeeTxHash == feeHash.String() {
+			err = fp.client.wallet.SetPublished(ctx, &feeHash, true)
+			if err != nil {
+				return err
+			}
+		}
 		fp.schedule("confirm payment", fp.confirmPayment)
 		return nil
 	case "confirmed":
 		fp.remove("confirmed by VSP")
 		// nothing scheduled
-		fp.mu.Lock()
-		feeHash := fp.feeHash
-		fp.mu.Unlock()
 		err = fp.ticket.UpdateFeeConfirmed(ctx, feeHash, fp.client.URL, fp.client.PubKey)
 		if err != nil {
 			return err

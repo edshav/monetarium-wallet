@@ -20,6 +20,7 @@ import (
 	"github.com/decred/slog"
 	"github.com/decred/vspd/types/v3"
 	"github.com/monetarium/monetarium-node/chaincfg/chainhash"
+	"github.com/monetarium/monetarium-node/cointype"
 	"github.com/monetarium/monetarium-node/txscript/stdaddr"
 	"github.com/monetarium/monetarium-node/wire"
 	"github.com/monetarium/monetarium-wallet/wallet/udb"
@@ -376,5 +377,107 @@ func TestVSPProcessManagedTicketsContinuesPastConfirmed(t *testing.T) {
 	c.mu.Unlock()
 	if !resumed {
 		t.Fatal("the unpaid ticket after a confirmed one was not resumed")
+	}
+}
+
+// TestVSPFeeChangeSpendableOnceBroadcast checks that the change of a fee tx
+// is not spent at minconf 0 while the VSP only holds the fee tx.  The VSP
+// broadcasts a received fee tx once the ticket has enough confirmations, and
+// until then the network does not know it: a ticket split funded from its
+// change was rejected as an orphan (issue #8).  Once the VSP reports this fee
+// tx as broadcast, its change may be spent.
+func TestVSPFeeChangeSpendableOnceBroadcast(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		status    string
+		otherTx   bool // the VSP reports a fee tx other than the wallet's
+		wantSpend bool
+	}{
+		{name: "received", status: "received"},
+		{name: "broadcast", status: "broadcast", wantSpend: true},
+		{name: "broadcast other tx", status: "broadcast", otherTx: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			var feeHash chainhash.Hash // set once the fee tx exists
+			c := testVSPClient(ctx, t, func(path string, body []byte) (int, any) {
+				switch path {
+				case "/api/v3/payfee":
+					// The fee tx was already submitted once.
+					return apiError(types.ErrFeeAlreadyReceived)
+				case "/api/v3/ticketstatus":
+					vspFeeHash := feeHash
+					if tc.otherTx {
+						vspFeeHash = chainhash.Hash{0xfe}
+					}
+					return http.StatusOK, types.TicketStatusResponse{
+						FeeTxStatus: tc.status,
+						FeeTxHash:   vspFeeHash.String(),
+						Request:     body,
+					}
+				}
+				return apiError(types.ErrInternalError)
+			})
+			w := c.wallet
+			ticket := testVSPTicket(ctx, t, c, 1)
+
+			// Fund the fee tx from an output of the wallet.
+			addr, err := w.NewInternalAddress(ctx, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ver, script := addr.(Address).PaymentScript()
+			fund := wire.NewMsgTx()
+			fund.AddTxIn(wire.NewTxIn(&wire.OutPoint{Hash: chainhash.Hash{2}}, 1e8, nil))
+			fund.AddTxOut(&wire.TxOut{Value: 1e8, Version: ver, PkScript: script})
+			if err := w.AddTransaction(ctx, fund, nil); err != nil {
+				t.Fatal(err)
+			}
+			feeTx := wire.NewMsgTx()
+			feeTx.AddTxIn(wire.NewTxIn(&wire.OutPoint{Hash: fund.TxHash()}, 1e8, nil))
+			if err := w.CreateVspPayment(ctx, feeTx, 1e7, ticket.votingAddr, 0, 0); err != nil {
+				t.Fatal(err)
+			}
+			feeHash = feeTx.TxHash()
+
+			fp := &vspFeePayment{
+				client:  c,
+				ctx:     ctx,
+				ticket:  ticket,
+				policy:  c.policy,
+				params:  w.chainParams,
+				fee:     1e7,
+				feeAddr: ticket.votingAddr,
+				feeTx:   feeTx,
+				feeHash: feeHash,
+			}
+			c.jobs[*ticket.Hash()] = fp // stopped on cleanup
+			if err := fp.reconcilePayment(); err != nil {
+				t.Fatal(err)
+			}
+
+			// Spend everything the wallet has at minconf 0.
+			var spent bool
+			err = walletdb.View(ctx, w.db, func(dbtx walletdb.ReadTx) error {
+				_, tip := w.txStore.MainChainTip(dbtx)
+				src := w.txStore.MakeInputSourceWithCoinType(dbtx, 0, 0,
+					tip, nil, cointype.CoinTypeVAR)
+				detail, err := src.SelectInputs(0, cointype.Zero())
+				if err != nil {
+					return err
+				}
+				for _, in := range detail.Inputs {
+					spent = spent || in.PreviousOutPoint.Hash == feeHash
+				}
+				return nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if spent != tc.wantSpend {
+				t.Fatalf("fee tx change spent at minconf 0 = %v, want %v",
+					spent, tc.wantSpend)
+			}
+		})
 	}
 }
