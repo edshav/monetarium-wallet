@@ -206,7 +206,8 @@ func (c *VSPClient) ProcessManagedTickets(ctx context.Context, tickets []*VSPTic
 // feeTx may be nil or may point to an empty transaction. It is modified with
 // the inputs and the fee and change outputs before returning without an error.
 // The fee transaction is also recorded as unpublised in the wallet, and the fee
-// hash is associated with the ticket.
+// hash is associated with the ticket.  On error the fee payment no longer holds
+// feeTx, and the caller should unlock its inputs.
 func (c *VSPClient) Process(ctx context.Context, ticket *VSPTicket, feeTx *wire.MsgTx) error {
 	vspTicket, err := ticket.VSPTicketInfo(ctx)
 	if err != nil && !errors.Is(err, errors.NotExist) {
@@ -234,24 +235,24 @@ func (c *VSPClient) Process(ctx context.Context, ticket *VSPTicket, feeTx *wire.
 			fp.feeTx = feeTx
 		}
 		fp.mu.Unlock()
-		err := fp.receiveFeeAddress()
-		if err != nil {
-			err := ticket.UpdateFeeErrored(ctx, c.Client.URL, c.Client.PubKey)
-			if err != nil {
-				return err
-			}
-			// XXX, retry? (old Process retried)
-			// but this may not be necessary any longer as the parent of
-			// the ticket is always relayed to the vsp as well.
-			return err
+		feeErr := fp.receiveFeeAddress()
+		if feeErr == nil {
+			feeErr = fp.makeFeeTx(feeTx)
 		}
-		err = fp.makeFeeTx(feeTx)
-		if err != nil {
-			err := ticket.UpdateFeeErrored(ctx, c.Client.URL, c.Client.PubKey)
-			if err != nil {
-				return err
+		if feeErr != nil {
+			// On failure the caller unlocks the inputs of feeTx, and a
+			// later purchase may spend them; after a failed makeFeeTx it
+			// may also have outputs but no signatures.  The scheduled
+			// attempt must not build on it.
+			fp.mu.Lock()
+			if fp.feeTx == feeTx {
+				fp.feeTx = nil
 			}
-			return err
+			fp.mu.Unlock()
+			if markErr := ticket.UpdateFeeErrored(ctx, c.Client.URL, c.Client.PubKey); markErr != nil {
+				return markErr
+			}
+			return feeErr
 		}
 		return fp.submitPayment()
 	case udb.VSPFeeProcessPaid:
