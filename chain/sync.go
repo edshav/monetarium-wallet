@@ -24,6 +24,7 @@ import (
 	"github.com/monetarium/monetarium-node/blockchain/stake"
 	"github.com/monetarium/monetarium-node/chaincfg/chainhash"
 	"github.com/monetarium/monetarium-node/crypto/blake256"
+	"github.com/monetarium/monetarium-node/gcs"
 	"github.com/monetarium/monetarium-node/mixing/mixpool"
 	"github.com/monetarium/monetarium-node/wire"
 	"github.com/jrick/wsrpc/v2"
@@ -41,6 +42,7 @@ type Syncer struct {
 	wallet   *wallet.Wallet
 	opts     *RPCOptions
 	rpc      *mond.RPC
+	blockRPC blockConnectedRPC // s.rpc; a fake node in tests
 	notifier *notifier
 
 	blake256Hasher   hash.Hash
@@ -412,6 +414,14 @@ type rescanner interface {
 	Rescan(ctx context.Context, blocks []chainhash.Hash, save func(block *chainhash.Hash, txs []*wire.MsgTx) error) error
 }
 
+// blockConnectedRPC is the part of the node RPC client used by
+// handleBlockConnected itself.  Its fallback to getMissingHeaders still uses
+// s.rpc.
+type blockConnectedRPC interface {
+	rescanner
+	CFilterV2(ctx context.Context, blockHash *chainhash.Hash) (*gcs.FilterV2, uint32, []chainhash.Hash, error)
+}
+
 // fetchMissingRelevantTxs asks mond for the relevant transactions of every
 // chain block that has no relevantTxs entry.  Such blocks reached the sidechain
 // forest without a blockconnected notification: headers fetched by getHeaders
@@ -631,6 +641,7 @@ func (s *Syncer) Run(ctx context.Context) (err error) {
 	}
 	defer wsClient.Close()
 	s.rpc = mond.New(wsClient)
+	s.blockRPC = s.rpc
 
 	// Verify that the server is running on the expected network.
 	var netID wire.CurrencyNet
@@ -901,7 +912,7 @@ func (s *Syncer) handleBlockConnected(ctx context.Context, header *wire.BlockHea
 	}
 
 	blockHash := header.BlockHash()
-	filter, proofIndex, proof, err := s.rpc.CFilterV2(ctx, &blockHash)
+	filter, proofIndex, proof, err := s.blockRPC.CFilterV2(ctx, &blockHash)
 	if err != nil {
 		return err
 	}
@@ -927,7 +938,7 @@ func (s *Syncer) handleBlockConnected(ctx context.Context, header *wire.BlockHea
 		return err
 	}
 	if len(bestChain) != 0 {
-		err = fetchMissingRelevantTxs(ctx, s.rpc, bestChain, s.relevantTxs)
+		err = fetchMissingRelevantTxs(ctx, s.blockRPC, bestChain, s.relevantTxs)
 		if err != nil {
 			return err
 		}
