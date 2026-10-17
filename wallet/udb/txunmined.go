@@ -433,14 +433,14 @@ func (s *Store) PruneUnmined(dbtx walletdb.ReadWriteTx, stakeDiff int64) ([]*cha
 	return removed, nil
 }
 
-// hasValidInputs checks if all inputs of an unmined transaction are still
-// spendable. An input is valid if it either:
-// - References an unspent mined output (in the unspent bucket)
-// - References an output from another unmined transaction (in unmined credits)
+// hasValidInputs reports whether no input of an unmined transaction spends a
+// wallet credit that is already spent by a mined transaction.  That happens
+// after a reorg, when the unmined transaction was orphaned by a conflicting
+// mined one.
 //
-// If any input references an output that has been spent by a mined transaction
-// (e.g., after a reorg), the transaction is considered orphaned and should be
-// removed.
+// An input the wallet has no mined credit for (an output of an unmined
+// transaction, or an output the wallet never owned, e.g. the inputs of an
+// incoming payment) is not known to be double spent and counts as valid.
 func (s *Store) hasValidInputs(ns walletdb.ReadBucket, tx *wire.MsgTx) bool {
 	txType := stake.DetermineTxType(tx)
 
@@ -451,23 +451,19 @@ func (s *Store) hasValidInputs(ns walletdb.ReadBucket, tx *wire.MsgTx) bool {
 		}
 
 		prevOut := &input.PreviousOutPoint
-		k := canonicalOutPoint(&prevOut.Hash, prevOut.Index)
-
-		// Check if the previous output is an unspent mined credit
-		if existsRawUnspent(ns, k, s.chainParams) != nil {
+		k, v := latestTxRecord(ns, prevOut.Hash[:])
+		if v == nil {
 			continue
 		}
-
-		// Check if the previous output is from another unmined transaction
-		if existsRawUnminedCredit(ns, k, s.chainParams) != nil {
+		var block Block
+		if err := readRawTxRecordBlock(k, &block); err != nil {
+			log.Errorf("Failed to read block of tx record %v: %v", &prevOut.Hash, err)
 			continue
 		}
-
-		// The input references an output that is neither unspent nor from
-		// an unmined transaction. This means the output has been spent by
-		// a mined transaction (likely after a reorg), so this unmined tx
-		// is orphaned.
-		return false
+		credVal := existsRawCredit(ns, keyCredit(&prevOut.Hash, prevOut.Index, &block))
+		if credVal != nil && extractRawCreditIsSpent(credVal) {
+			return false
+		}
 	}
 
 	return true
