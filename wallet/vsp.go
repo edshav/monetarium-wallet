@@ -134,7 +134,7 @@ func (c *VSPClient) ProcessUnprocessedTickets(ctx context.Context, tickets []*VS
 		go func(t *VSPTicket) {
 			defer wg.Done()
 			err := c.Process(ctx, t, nil)
-			if err != nil {
+			if err != nil && !errors.Is(err, errStopped) {
 				c.log.Error(err)
 			}
 		}(ticket)
@@ -206,8 +206,10 @@ func (c *VSPClient) ProcessManagedTickets(ctx context.Context, tickets []*VSPTic
 // feeTx may be nil or may point to an empty transaction. It is modified with
 // the inputs and the fee and change outputs before returning without an error.
 // The fee transaction is also recorded as unpublised in the wallet, and the fee
-// hash is associated with the ticket.  On error the fee payment no longer holds
-// feeTx, and the caller should unlock its inputs.
+// hash is associated with the ticket.  On error the caller should unlock the
+// inputs of feeTx.  The fee payment keeps feeTx only if a scheduled attempt
+// made its own fee tx in it meanwhile, which the wallet records as spending
+// those inputs.
 func (c *VSPClient) Process(ctx context.Context, ticket *VSPTicket, feeTx *wire.MsgTx) error {
 	vspTicket, err := ticket.VSPTicketInfo(ctx)
 	if err != nil && !errors.Is(err, errors.NotExist) {
@@ -234,6 +236,7 @@ func (c *VSPClient) Process(ctx context.Context, ticket *VSPTicket, feeTx *wire.
 		if fp.feeTx == nil {
 			fp.feeTx = feeTx
 		}
+		startHash := fp.feeHash
 		fp.mu.Unlock()
 		feeErr := fp.receiveFeeAddress()
 		if feeErr == nil {
@@ -243,12 +246,18 @@ func (c *VSPClient) Process(ctx context.Context, ticket *VSPTicket, feeTx *wire.
 			// On failure the caller unlocks the inputs of feeTx, and a
 			// later purchase may spend them; after a failed makeFeeTx it
 			// may also have outputs but no signatures.  The scheduled
-			// attempt must not build on it.
+			// attempt must not build on it, unless it made its own fee tx
+			// meanwhile (new hash); that attempt also owns the recorded
+			// status, which marking it errored would erase.
 			fp.mu.Lock()
-			if fp.feeTx == feeTx {
+			madeMeanwhile := fp.feeHash != startHash
+			if fp.feeTx == feeTx && !madeMeanwhile {
 				fp.feeTx = nil
 			}
 			fp.mu.Unlock()
+			if madeMeanwhile {
+				return feeErr
+			}
 			if markErr := ticket.UpdateFeeErrored(ctx, c.Client.URL, c.Client.PubKey); markErr != nil {
 				return markErr
 			}
