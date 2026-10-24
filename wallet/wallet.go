@@ -4583,8 +4583,9 @@ func (w *Wallet) ListUnspent(ctx context.Context, minconf, maxconf int32, addres
 				continue
 			}
 
-			// Only mature coinbase outputs are included.
-			if output.FromCoinBase {
+			// Only mature coinbase outputs are included.  Miner SSFee
+			// outputs carry the coinbase flag and are checked below.
+			if output.FromCoinBase && details.TxRecord.TxType != stake.TxTypeSSFee {
 				if !coinbaseMatured(w.chainParams, output.Height, tipHeight) {
 					continue
 				}
@@ -4618,8 +4619,8 @@ func (w *Wallet) ListUnspent(ctx context.Context, minconf, maxconf int32, addres
 				}
 			case stake.TxTypeSSFee:
 				// All spendable outputs (non-OP_RETURN) for SSFee tx are only spendable
-				// after coinbase maturity many blocks.
-				if !coinbaseMatured(w.chainParams, details.Height(), tipHeight) {
+				// after SSFee maturity.
+				if !udb.SSFeeMatured(w.chainParams, output.HasExpiry, details.Height(), tipHeight) {
 					continue
 				}
 			}

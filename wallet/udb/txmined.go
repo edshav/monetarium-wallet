@@ -3496,6 +3496,44 @@ func ticketChangeMatured(params *chaincfg.Params, txHeight, curHeight int32) boo
 	return txHeight >= 0 && curHeight-txHeight+1 > int32(params.SStxChangeMaturity)
 }
 
+// SSFeeMatured returns whether an output of an SSFee transaction mined at
+// txHeight has reached maturity in a chain with tip height curHeight.
+//
+// mond requires coinbase maturity for an output of a transaction with an
+// expiry, and for an OP_SSGEN output while the treasury agenda (DCP0006) is
+// active; otherwise it requires ticket change maturity.  The agenda expired in
+// 2021, before mainnet and testnet began, so it can never activate on them.
+//
+// shortcut: simnet and regnet can vote the agenda in, so they keep coinbase
+// maturity (late, never early); query the agenda state if that matters there.
+func SSFeeMatured(params *chaincfg.Params, hasExpiry bool, txHeight, curHeight int32) bool {
+	if !hasExpiry && (params.Net == wire.MainNet || params.Net == wire.TestNet3) {
+		return ticketChangeMatured(params, txHeight, curHeight)
+	}
+	return coinbaseMatured(params, txHeight, curHeight)
+}
+
+// stakeGenMatured returns whether an OP_SSGEN or OP_SSRTX credit has reached
+// maturity in a chain with tip height curHeight.  Votes and revocations need
+// coinbase maturity; SSFee outputs may mature earlier (see SSFeeMatured).
+func (s *Store) stakeGenMatured(ns walletdb.ReadBucket, cKey []byte, hasExpiry bool, curHeight int32) bool {
+	txHeight := extractRawCreditHeight(cKey)
+	if coinbaseMatured(s.chainParams, txHeight, curHeight) {
+		return true
+	}
+	// Only SSFee markers are cached, so a vote's lookup reads its tx record:
+	// keep it to credits that are not yet coinbase mature.
+	return getSSFeeMarkerType(ns, cKey) != stake.SSFeeMarkerNone &&
+		SSFeeMatured(s.chainParams, hasExpiry, txHeight, curHeight)
+}
+
+// StakeGenMatured returns whether an OP_SSGEN or OP_SSRTX credit returned by
+// UnspentOutputs has reached maturity in a chain with tip height curHeight.
+func (s *Store) StakeGenMatured(dbtx walletdb.ReadTx, c *Credit, curHeight int32) bool {
+	ns := dbtx.ReadBucket(wtxmgrBucketKey)
+	return s.stakeGenMatured(ns, keyCredit(&c.Hash, c.Index, &c.Block), c.HasExpiry, curHeight)
+}
+
 // ticketMatured returns whether a ticket mined at txHeight has
 // reached ticket maturity in a chain with a tip height curHeight.
 func ticketMatured(params *chaincfg.Params, txHeight, curHeight int32) bool {
@@ -3858,8 +3896,12 @@ func (s *Store) MakeInputSourceWithCoinType(dbtx walletdb.ReadTx, account uint32
 					}
 				}
 				switch opcode {
-				case txscript.OP_SSGEN, txscript.OP_SSRTX, txscript.OP_TADD,
-					txscript.OP_TGEN:
+				case txscript.OP_SSGEN, txscript.OP_SSRTX:
+					hasExpiry := fetchRawCreditHasExpiry(cVal, DBVersion)
+					if !s.stakeGenMatured(ns, cKey, hasExpiry, syncHeight) {
+						continue
+					}
+				case txscript.OP_TADD, txscript.OP_TGEN:
 					if !coinbaseMatured(s.chainParams, txHeight, syncHeight) {
 						continue
 					}
@@ -4120,7 +4162,7 @@ func (s *Store) balanceFullScan(dbtx walletdb.ReadTx, minConf int32, syncHeight 
 			case txscript.OP_SSGEN:
 				fallthrough
 			case txscript.OP_SSRTX:
-				if coinbaseMatured(s.chainParams, height, syncHeight) {
+				if s.stakeGenMatured(ns, cKey, fetchRawCreditHasExpiry(cVal, DBVersion), syncHeight) {
 					// Update per-coin balance
 					coinBalance.Spendable += utxoAmt
 					// Update legacy VAR balance for backward compatibility
@@ -4273,8 +4315,8 @@ func (s *Store) balanceFullScan(dbtx walletdb.ReadTx, minConf int32, syncHeight 
 				coinBalance.SKATotal = coinBalance.SKATotal.Add(skaAmt)
 			case txscript.OP_SSGEN:
 				// SSFee SF (staker fee) outputs for SKA use OP_SSGEN scripts
-				// These are copied from vote reward outputs and need coinbase maturity
-				if coinbaseMatured(s.chainParams, height, syncHeight) {
+				// These are copied from vote reward outputs; see SSFeeMatured
+				if s.stakeGenMatured(ns, cKey, fetchRawCreditHasExpiry(cVal, DBVersion), syncHeight) {
 					coinBalance.Spendable += utxoAmt
 					coinBalance.SKASpendable = coinBalance.SKASpendable.Add(skaAmt)
 				} else {
@@ -4710,7 +4752,7 @@ func (s *Store) AccountBalanceByCoinType(dbtx walletdb.ReadTx, minConf int32, ac
 			case txscript.OP_SSGEN:
 				fallthrough
 			case txscript.OP_SSRTX:
-				if coinbaseMatured(s.chainParams, height, syncHeight) {
+				if s.stakeGenMatured(ns, cKey, fetchRawCreditHasExpiry(cVal, DBVersion), syncHeight) {
 					balance.Spendable += utxoAmt
 					if isSKA {
 						balance.SKASpendable = balance.SKASpendable.Add(skaAmt)

@@ -2317,7 +2317,7 @@ func (w *Wallet) findEligibleOutputs(dbtx walletdb.ReadTx, account uint32, minco
 		// Make sure everything we're trying to spend is actually mature.
 		switch class {
 		case stdscript.STStakeGenPubKeyHash, stdscript.STStakeGenScriptHash:
-			if !coinbaseMatured(w.chainParams, output.Height, currentHeight) {
+			if !w.txStore.StakeGenMatured(dbtx, output, currentHeight) {
 				continue
 			}
 		case stdscript.STStakeRevocationPubKeyHash, stdscript.STStakeRevocationScriptHash:
@@ -2444,7 +2444,7 @@ func (w *Wallet) findEligibleOutputsAmount(dbtx walletdb.ReadTx, account uint32,
 		// Make sure everything we're trying to spend is actually mature.
 		switch class {
 		case stdscript.STStakeGenPubKeyHash, stdscript.STStakeGenScriptHash:
-			if !coinbaseMatured(w.chainParams, output.Height, currentHeight) {
+			if !w.txStore.StakeGenMatured(dbtx, output, currentHeight) {
 				return true
 			}
 		case stdscript.STStakeRevocationPubKeyHash, stdscript.STStakeRevocationScriptHash:

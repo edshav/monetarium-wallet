@@ -15,6 +15,7 @@ import (
 	"github.com/monetarium/monetarium-node/dcrutil"
 	"github.com/monetarium/monetarium-node/txscript"
 	"github.com/monetarium/monetarium-node/wire"
+	"github.com/monetarium/monetarium-wallet/wallet/udb"
 )
 
 // createMockSSFeeTx creates a mock SSFee transaction for testing
@@ -128,11 +129,11 @@ func TestSSFeeTransactionType(t *testing.T) {
 	}
 }
 
-// TestSSFeeOutputMaturity verifies that SSFee outputs require coinbase maturity
+// TestSSFeeOutputMaturity verifies the mainnet SSFee maturity boundary
 func TestSSFeeOutputMaturity(t *testing.T) {
 	t.Parallel()
 	params := chaincfg.MainNetParams()
-	maturity := int32(params.CoinbaseMaturity)
+	maturity := int32(params.SStxChangeMaturity)
 
 	tests := []struct {
 		name       string
@@ -188,10 +189,10 @@ func TestSSFeeOutputMaturity(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			// SSFee outputs should use coinbase maturity rules
-			mature := coinbaseMatured(params, test.txHeight, test.tipHeight)
+			// The treasury agenda cannot activate on mainnet
+			mature := udb.SSFeeMatured(params, false, test.txHeight, test.tipHeight)
 			if mature != test.wantMature {
-				t.Errorf("coinbaseMatured(%d, %d) = %v, want %v",
+				t.Errorf("SSFeeMatured(%d, %d) = %v, want %v",
 					test.txHeight, test.tipHeight, mature, test.wantMature)
 			}
 		})
@@ -202,7 +203,7 @@ func TestSSFeeOutputMaturity(t *testing.T) {
 func TestSSFeeOutputSpendability(t *testing.T) {
 	t.Parallel()
 	params := chaincfg.MainNetParams()
-	maturity := int32(params.CoinbaseMaturity)
+	maturity := int32(params.SStxChangeMaturity)
 
 	// Create a mock TransactionOutput from SSFee
 	createSSFeeOutput := func(coinType cointype.CoinType, value int64, height int32) *TransactionOutput {
@@ -269,7 +270,7 @@ func TestSSFeeOutputSpendability(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 			// Check if output would be considered mature
-			mature := coinbaseMatured(params, test.output.ContainingBlock.Height, test.tipHeight)
+			mature := udb.SSFeeMatured(params, false, test.output.ContainingBlock.Height, test.tipHeight)
 			if mature != test.shouldBeSpendable {
 				t.Errorf("%s: maturity check failed - got %v, want %v",
 					test.description, mature, test.shouldBeSpendable)
@@ -317,7 +318,7 @@ func TestSSFeeMultipleCoinTypes(t *testing.T) {
 func TestSSFeeInUnspentOutputs(t *testing.T) {
 	t.Parallel()
 	params := chaincfg.MainNetParams()
-	maturity := int32(params.CoinbaseMaturity)
+	maturity := int32(params.SStxChangeMaturity)
 
 	// Test that SSFee outputs are properly filtered based on maturity
 	tests := []struct {
@@ -401,7 +402,7 @@ func TestSSFeeInUnspentOutputs(t *testing.T) {
 			}
 
 			// Check maturity
-			mature := coinbaseMatured(params, test.outputHeight, test.tipHeight)
+			mature := udb.SSFeeMatured(params, false, test.outputHeight, test.tipHeight)
 
 			// Check coin type filter
 			coinTypeMatch := test.policyCoinType == nil || policy.CoinType == test.outputCoinType
