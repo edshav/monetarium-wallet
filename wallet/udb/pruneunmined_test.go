@@ -108,7 +108,7 @@ func testPruneUnminedDoubleSpends(t *testing.T, ct cointype.CoinType) {
 			return err
 		}
 
-		removed, err = s.PruneUnmined(dbtx, 0)
+		removed, err = s.PruneUnmined(dbtx, 0, true)
 		return err
 	})
 	if err != nil {

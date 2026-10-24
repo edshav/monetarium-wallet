@@ -358,7 +358,13 @@ func (s *Store) unminedTxHashes(ns walletdb.ReadBucket) ([]*chainhash.Hash, erro
 //   - Votes that do not vote on the tip block
 //   - Regular transactions whose inputs have been double-spent on chain
 //     (e.g., after a reorg where the transaction was orphaned)
-func (s *Store) PruneUnmined(dbtx walletdb.ReadWriteTx, stakeDiff int64) ([]*chainhash.Hash, error) {
+//   - SSFee transactions, when pruneSSFee is set, and their spenders
+//
+// An unmined SSFee was detached by a reorg: SSFee transactions are never in a
+// mempool.  Pass pruneSSFee only when the transactions of the attached blocks
+// have been recorded, because an SSFee mined again in them is otherwise still
+// unmined.
+func (s *Store) PruneUnmined(dbtx walletdb.ReadWriteTx, stakeDiff int64, pruneSSFee bool) ([]*chainhash.Hash, error) {
 	ns := dbtx.ReadWriteBucket(wtxmgrBucketKey)
 
 	tipHash, tipHeight := s.MainChainTip(dbtx)
@@ -395,6 +401,11 @@ func (s *Store) PruneUnmined(dbtx walletdb.ReadWriteTx, stakeDiff int64) ([]*cha
 				continue
 			}
 			reason = "missed or invalid vote"
+		case stake.IsSSFee(&tx):
+			if !pruneSSFee {
+				continue
+			}
+			reason = "detached SSFee"
 		case stake.IsSSRtx(&tx):
 			// Revocations: check if their inputs are still valid
 			if s.hasValidInputs(ns, &tx) {

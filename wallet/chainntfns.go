@@ -232,8 +232,14 @@ func (w *Wallet) ChainSwitch(ctx context.Context, forest *SidechainForest, chain
 		//
 		// TODO: The stake difficulty passed here is not correct.  This must be
 		// the difficulty of the next block, not the tip block.
+		//
+		// An SSFee mined again in the new chain is still unmined until the
+		// transactions of every main chain block are recorded, that is
+		// until there is no rescan point.
+		rescanPoint, rescanErr := w.rescanPoint(dbtx)
+		pruneSSFee := rescanErr == nil && rescanPoint == nil
 		tip := chain[len(chain)-1]
-		hashes, err := w.txStore.PruneUnmined(dbtx, tip.Header.SBits)
+		hashes, err := w.txStore.PruneUnmined(dbtx, tip.Header.SBits, pruneSSFee)
 		if err != nil {
 			log.Errorf("Failed to prune unmined transactions when "+
 				"connecting block height %v: %v", tip.Header.Height, err)
