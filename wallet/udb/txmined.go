@@ -1289,6 +1289,7 @@ func (s *Store) moveMinedTx(ns walletdb.ReadWriteBucket, addrmgrNs walletdb.Read
 		cred.change = change
 		cred.opCode = fetchRawUnminedCreditTagOpCode(v)
 		cred.isCoinbase = fetchRawUnminedCreditTagIsCoinbase(v)
+		cred.hasExpiry = rec.MsgTx.Expiry != wire.NoExpiryValue
 		cred.coinType = rec.MsgTx.TxOut[i].CoinType
 
 		// Legacy credit output values may be of the wrong
