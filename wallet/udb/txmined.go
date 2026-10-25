@@ -3502,8 +3502,10 @@ func ticketChangeMatured(params *chaincfg.Params, txHeight, curHeight int32) boo
 //
 // mond requires coinbase maturity for an output of a transaction with an
 // expiry, and for an OP_SSGEN output while the treasury agenda (DCP0006) is
-// active; otherwise it requires ticket change maturity.  The agenda expired in
-// 2021, before mainnet and testnet began, so it can never activate on them.
+// active; otherwise it requires ticket change maturity.  The agenda
+// (chaincfg.VoteIDTreasury) expired in 2021, before mainnet and testnet began,
+// so it can never activate on them; TestTreasuryAgendaExpiredBeforeGenesis
+// fails if their params change that.
 //
 // shortcut: simnet and regnet can vote the agenda in, so they keep coinbase
 // maturity (late, never early); query the agenda state if that matters there.
@@ -3523,9 +3525,9 @@ func (s *Store) stakeGenMatured(ns walletdb.ReadBucket, cKey []byte, hasExpiry b
 		return true
 	}
 	// Only SSFee markers are cached, so a vote's lookup reads its tx record:
-	// keep it to credits that are not yet coinbase mature.
-	return getSSFeeMarkerType(ns, cKey) != stake.SSFeeMarkerNone &&
-		SSFeeMatured(s.chainParams, hasExpiry, txHeight, curHeight)
+	// keep it to credits that only the SSFee rule could make mature.
+	return SSFeeMatured(s.chainParams, hasExpiry, txHeight, curHeight) &&
+		getSSFeeMarkerType(ns, cKey) != stake.SSFeeMarkerNone
 }
 
 // StakeGenMatured returns whether an OP_SSGEN or OP_SSRTX credit returned by

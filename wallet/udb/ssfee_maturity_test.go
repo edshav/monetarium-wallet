@@ -52,6 +52,31 @@ func TestSSFeeMatured(t *testing.T) {
 	}
 }
 
+// TestTreasuryAgendaExpiredBeforeGenesis guards SSFeeMatured's premise: on
+// mainnet and testnet the treasury agenda expires no later than the genesis
+// block, so it can never activate there.
+func TestTreasuryAgendaExpiredBeforeGenesis(t *testing.T) {
+	for _, params := range []*chaincfg.Params{chaincfg.MainNetParams(), chaincfg.TestNet3Params()} {
+		genesis := uint64(params.GenesisBlock.Header.Timestamp.Unix())
+		found := false
+		for _, deployments := range params.Deployments {
+			for _, d := range deployments {
+				if d.Vote.Id != chaincfg.VoteIDTreasury {
+					continue
+				}
+				found = true
+				if d.ExpireTime > genesis {
+					t.Errorf("%s: treasury agenda expires at %d, after genesis %d; "+
+						"SSFeeMatured must follow the agenda state", params.Name, d.ExpireTime, genesis)
+				}
+			}
+		}
+		if !found {
+			t.Errorf("%s: no treasury agenda deployment", params.Name)
+		}
+	}
+}
+
 // TestSSFeeCreditMaturity checks input selection and balances for OP_SSGEN
 // credits on testnet (ticket change maturity 1, coinbase maturity 16): an
 // SSFee output is spendable at the ticket change boundary, while an SSFee
