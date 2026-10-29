@@ -1172,7 +1172,19 @@ func (s *Syncer) handleTxInvs(ctx context.Context, rp *p2p.RemotePeer, hashes []
 		err := s.wallet.AddTransaction(ctx, tx, nil)
 		if err != nil {
 			op := errors.Opf(opf, rp.RemoteAddr())
-			log.Warn(errors.E(op, err))
+			err := errors.E(op, err)
+			log.Warn(err)
+
+			// Disconnect the peer if the transaction contains an invalid
+			// attempt to spend a UTXO owned by this wallet. This only applies
+			// to full node peers because they should validate the transaction
+			// before relaying it. SPV peers are not able to validate
+			// transactions before relaying them.
+			if errors.Is(err, errors.ScriptFailure) &&
+				rp.Services()&wire.SFNodeNetwork == wire.SFNodeNetwork {
+				rp.Disconnect(err)
+				return
+			}
 		}
 	}
 	s.mempoolTxs(relevant)
