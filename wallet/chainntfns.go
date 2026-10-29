@@ -20,6 +20,7 @@ import (
 	"github.com/monetarium/monetarium-node/chaincfg/chainhash"
 	"github.com/monetarium/monetarium-node/cointype"
 	"github.com/monetarium/monetarium-node/crypto/rand"
+	"github.com/monetarium/monetarium-node/dcrutil"
 	"github.com/monetarium/monetarium-node/txscript"
 	"github.com/monetarium/monetarium-node/txscript/stdaddr"
 	"github.com/monetarium/monetarium-node/txscript/stdscript"
@@ -354,6 +355,72 @@ func (w *Wallet) AddTransaction(ctx context.Context, tx *wire.MsgTx, blockHash *
 			*meta, err = w.txStore.GetBlockMetaForHash(txmgrNs, blockHash)
 			if err != nil {
 				return err
+			}
+		}
+
+		// If the transaction is unmined, inputs which reference UTXOs owned by
+		// this wallet require extra scrutiny before the transaction is
+		// accepted. This is necessary because a malicious SPV peer could relay
+		// a forged transaction which falsely claims to spend a UTXO from this
+		// wallet.
+		// Mined transactions do not need these extra checks because they have
+		// already been validated by consensus.
+		if header == nil {
+			txCoinType := wire.GetPrimaryCoinType(&rec.MsgTx)
+			for i, in := range rec.MsgTx.TxIn {
+				prevOut := &in.PreviousOutPoint
+				credit, err := w.txStore.UnspentOutput(txmgrNs, *prevOut, true)
+				if errors.Is(err, errors.NotExist) {
+					// Not a UTXO belonging to this wallet, skip.
+					continue
+				}
+				if err != nil {
+					return errors.E(op, err)
+				}
+
+				// UTXOs are keyed in the DB without their transaction tree, so
+				// an explicit check is needed to validate tree.
+				if credit.OutPoint != *prevOut {
+					return errors.E(op, errors.ScriptFailure, errors.Errorf(
+						"input %d spends %v from the wrong transaction tree", i, prevOut))
+				}
+
+				// Transactions are single-coin, so the spent output must be
+				// of the coin type of the transaction.
+				if credit.CoinType != txCoinType {
+					return errors.E(op, errors.ScriptFailure, errors.Errorf(
+						"input %d spends %v output %v in a %v transaction", i,
+						credit.CoinType, prevOut, txCoinType))
+				}
+
+				// ValueIn is not committed to by the signature hash, so script
+				// execution below does not cover it.
+				if in.ValueIn != int64(credit.Amount) {
+					return errors.E(op, errors.ScriptFailure, errors.Errorf(
+						"input %d claims value %v for %v which is worth %v", i,
+						dcrutil.Amount(in.ValueIn), prevOut, credit.Amount))
+				}
+
+				// SKAValueIn is committed to by the signature hash, but a
+				// signature over a wrong value is still not minable, so compare
+				// it as consensus does: absent for VAR, the exact SKA amount
+				// for SKA.
+				wantSKA := credit.SKAAmount.BigInt()
+				gotSKA := in.SKAValueIn
+				if gotSKA == nil {
+					gotSKA = new(big.Int)
+				}
+				if gotSKA.Cmp(wantSKA) != 0 {
+					return errors.E(op, errors.ScriptFailure, errors.Errorf(
+						"input %d claims SKA value %v for %v which is worth %v", i,
+						gotSKA, prevOut, wantSKA))
+				}
+
+				// Validate the signature.
+				err = validateTxInput(op, tx, i, credit.PkScript)
+				if err != nil {
+					return err
+				}
 			}
 		}
 

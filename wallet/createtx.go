@@ -1123,24 +1123,35 @@ func (w *Wallet) txToMultisigInternal(ctx context.Context, op errors.Op, dbtx wa
 	return created, scAddr, msScript, nil
 }
 
+// validateTxInput verifies that input i of tx satisfies prevScript, the
+// previous output script it redeems.
+func validateTxInput(op errors.Op, tx *wire.MsgTx, i int, prevScript []byte) error {
+	vm, err := txscript.NewEngine(prevScript, tx, i,
+		sanityVerifyFlags, scriptVersionAssumed, nil)
+	if err != nil {
+		// A sigScript which does not parse fails here, before execution.
+		return errors.E(op, errors.ScriptFailure, err)
+	}
+	err = vm.Execute()
+	if err != nil {
+		prevOut := &tx.TxIn[i].PreviousOutPoint
+		sigScript := tx.TxIn[i].SignatureScript
+
+		log.Errorf("Script validation failed (outpoint %v pkscript %x sigscript %x): %v",
+			prevOut, prevScript, sigScript, err)
+		return errors.E(op, errors.ScriptFailure, err)
+	}
+	return nil
+}
+
 // validateMsgTx verifies transaction input scripts for tx.  All previous output
 // scripts from outputs redeemed by the transaction, in the same order they are
 // spent, must be passed in the prevScripts slice.
 func validateMsgTx(op errors.Op, tx *wire.MsgTx, prevScripts [][]byte) error {
 	for i, prevScript := range prevScripts {
-		vm, err := txscript.NewEngine(prevScript, tx, i,
-			sanityVerifyFlags, scriptVersionAssumed, nil)
+		err := validateTxInput(op, tx, i, prevScript)
 		if err != nil {
-			return errors.E(op, err)
-		}
-		err = vm.Execute()
-		if err != nil {
-			prevOut := &tx.TxIn[i].PreviousOutPoint
-			sigScript := tx.TxIn[i].SignatureScript
-
-			log.Errorf("Script validation failed (outpoint %v pkscript %x sigscript %x): %v",
-				prevOut, prevScript, sigScript, err)
-			return errors.E(op, errors.ScriptFailure, err)
+			return err
 		}
 	}
 	return nil
