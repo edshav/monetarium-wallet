@@ -10,11 +10,14 @@ import (
 	"net"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/monetarium/monetarium-node/addrmgr"
+	blockchain "github.com/monetarium/monetarium-node/blockchain/standalone"
 	"github.com/monetarium/monetarium-node/chaincfg"
 	"github.com/monetarium/monetarium-node/chaincfg/chainhash"
 	"github.com/monetarium/monetarium-node/cointype"
+	"github.com/monetarium/monetarium-node/gcs/blockcf2"
 	"github.com/monetarium/monetarium-node/txscript"
 	"github.com/monetarium/monetarium-node/txscript/stdaddr"
 	"github.com/monetarium/monetarium-node/wire"
@@ -94,6 +97,47 @@ func disconnected(rp *p2p.RemotePeer) bool {
 	}
 }
 
+// testBlocks returns a block on top of genesis whose one tx pays pkScript, and
+// a forged copy with the same header, and so the same hash, but a tx the
+// header's merkle root does not commit to.
+func testBlocks(pkScript []byte) (block, forged *wire.MsgBlock) {
+	params := chaincfg.SimNetParams()
+	tx := wire.NewMsgTx()
+	tx.AddTxIn(wire.NewTxIn(&wire.OutPoint{Hash: chainhash.Hash{1}}, 1e8, nil))
+	tx.AddTxOut(wire.NewTxOut(1e8, pkScript))
+	header := wire.BlockHeader{
+		PrevBlock:  params.GenesisHash,
+		Height:     1,
+		Bits:       params.PowLimitBits,
+		MerkleRoot: blockchain.CalcCombinedTxTreeMerkleRoot([]*wire.MsgTx{tx}, nil),
+	}
+	block = wire.NewMsgBlock(&header)
+	block.AddTransaction(tx)
+
+	other := tx.Copy()
+	other.TxOut[0].Value--
+	forged = wire.NewMsgBlock(&header)
+	forged.AddTransaction(other)
+	return block, forged
+}
+
+// replaceOnDisconnect swaps good in for bad once bad is disconnected, as the
+// connection loop of Run would drop it and later connect another peer.
+func replaceOnDisconnect(s *Syncer, bad, good *p2p.RemotePeer) {
+	s.remotes = map[string]*p2p.RemotePeer{"bad": bad}
+	go func() {
+		<-bad.Done()
+		s.remotesMu.Lock()
+		delete(s.remotes, "bad")
+		s.remotes["good"] = good
+		if s.remoteAvailable != nil {
+			close(s.remoteAvailable)
+			s.remoteAvailable = nil
+		}
+		s.remotesMu.Unlock()
+	}()
+}
+
 func newTestWallet(t *testing.T) *wallet.Wallet {
 	t.Helper()
 	ctx := context.Background()
@@ -117,6 +161,164 @@ func newTestWallet(t *testing.T) *wallet.Wallet {
 		t.Fatal(err)
 	}
 	return w
+}
+
+// TestBlocksRejectsForgedTransactions checks that Blocks does not return a
+// block whose transactions do not match the merkle root of its header.  A
+// block hash commits only to the header, so a peer can answer a request with
+// the right header and any transactions.  The peer is disconnected and the
+// blocks are fetched from another one.  The forged block comes second, so
+// every block of a reply is checked, not only the first.
+func TestBlocksRejectsForgedTransactions(t *testing.T) {
+	first, _ := testBlocks([]byte{txscript.OP_TRUE})
+	second, forged := testBlocks([]byte{txscript.OP_TRUE, txscript.OP_TRUE})
+	bad := connectFakePeer(t, wire.SFNodeNetwork, []*wire.MsgBlock{first, forged}, nil)
+	good := connectFakePeer(t, wire.SFNodeNetwork, []*wire.MsgBlock{first, second}, nil)
+	s := &Syncer{}
+	replaceOnDisconnect(s, bad, good)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	h1, h2 := first.BlockHash(), second.BlockHash()
+	blocks, err := s.Blocks(ctx, []*chainhash.Hash{&h1, &h2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := blocks[1].Transactions[0].TxHash(), second.Transactions[0].TxHash(); got != want {
+		t.Fatalf("got block with tx %v, want %v", got, want)
+	}
+	if !disconnected(bad) {
+		t.Fatal("peer serving the forged block was not disconnected")
+	}
+}
+
+// TestBlocksAcceptsSKATransactions checks that an honest block holding an SKA
+// tx passes the merkle root check.  The tx hashes to the merkle root only with
+// its coin type and SKA amounts, which must survive the wire.
+func TestBlocksAcceptsSKATransactions(t *testing.T) {
+	params := chaincfg.SimNetParams()
+	tx := payment(0, []byte{txscript.OP_TRUE}, 1, 1)
+	header := wire.BlockHeader{
+		PrevBlock:  params.GenesisHash,
+		Height:     1,
+		Bits:       params.PowLimitBits,
+		MerkleRoot: blockchain.CalcCombinedTxTreeMerkleRoot([]*wire.MsgTx{tx}, nil),
+	}
+	block := wire.NewMsgBlock(&header)
+	block.AddTransaction(tx)
+	rp := connectFakePeer(t, wire.SFNodeNetwork, []*wire.MsgBlock{block}, nil)
+	s := &Syncer{remotes: map[string]*p2p.RemotePeer{"rp": rp}}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	hash := block.BlockHash()
+	blocks, err := s.Blocks(ctx, []*chainhash.Hash{&hash})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := blocks[0].Transactions[0]; got.TxHash() != tx.TxHash() {
+		t.Fatalf("got tx %v, want %v", got.TxHash(), tx.TxHash())
+	}
+	if disconnected(rp) {
+		t.Fatal("honest peer disconnected")
+	}
+}
+
+// TestRescanRejectsForgedTransactions checks the same for blocks fetched by
+// Rescan because their cfilter matches the wallet.
+func TestRescanRejectsForgedTransactions(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	w := newTestWallet(t)
+	addr, err := w.NewExternalAddress(ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, script := addr.PaymentScript()
+	block, forged := testBlocks(script)
+
+	// Put the block in the main chain with its cfilter.
+	filter, err := blockcf2.Regular(block, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := block.BlockHash()
+	var forest wallet.SidechainForest
+	node := wallet.NewBlockNode(&block.Header, &hash, filter)
+	if _, err := w.ChainSwitch(ctx, &forest, []*wallet.BlockNode{node}, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	bad := connectFakePeer(t, wire.SFNodeNetwork, []*wire.MsgBlock{forged}, nil)
+	good := connectFakePeer(t, wire.SFNodeNetwork, []*wire.MsgBlock{block}, nil)
+	// The filter takes the stdaddr type, not the wallet's own.
+	filterAddr, err := stdaddr.DecodeAddress(addr.String(), w.ChainParams())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &Syncer{
+		wallet:       w,
+		filterData:   blockcf2.Entries{script},
+		rescanFilter: wallet.NewRescanFilter([]stdaddr.Address{filterAddr}, nil),
+	}
+	replaceOnDisconnect(s, bad, good)
+
+	var saved []*wire.MsgTx
+	err = s.Rescan(ctx, []chainhash.Hash{hash}, func(_ *chainhash.Hash, txs []*wire.MsgTx) error {
+		saved = append(saved, txs...)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(saved) != 1 || saved[0].TxHash() != block.Transactions[0].TxHash() {
+		t.Fatalf("rescan saved %v, want the tx of the real block", saved)
+	}
+	if !disconnected(bad) {
+		t.Fatal("peer serving the forged block was not disconnected")
+	}
+}
+
+// TestScanChainRejectsForgedTransactions checks the same for blocks fetched
+// by scanChain while new headers are processed.
+func TestScanChainRejectsForgedTransactions(t *testing.T) {
+	script := []byte{txscript.OP_TRUE}
+	block, forged := testBlocks(script)
+	filter, err := blockcf2.Regular(block, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rp := connectFakePeer(t, wire.SFNodeNetwork, []*wire.MsgBlock{forged}, nil)
+	// A real wallet, so a forged block that gets through fails the
+	// assertions below instead of panicking.
+	s := &Syncer{wallet: newTestWallet(t), filterData: blockcf2.Entries{script}}
+	hash := block.BlockHash()
+	node := wallet.NewBlockNode(&block.Header, &hash, filter)
+	if _, err := s.scanChain(context.Background(), rp, []*wallet.BlockNode{node}, nil); err == nil {
+		t.Fatal("forged block accepted")
+	}
+	if !disconnected(rp) {
+		t.Fatal("peer serving the forged block was not disconnected")
+	}
+}
+
+// TestHandleBlockInvsRejectsForgedTransactions checks the same for a block
+// announced by inv.
+func TestHandleBlockInvsRejectsForgedTransactions(t *testing.T) {
+	_, forged := testBlocks([]byte{txscript.OP_TRUE})
+	rp := connectFakePeer(t, wire.SFNodeNetwork, []*wire.MsgBlock{forged}, nil)
+	ctx := context.Background()
+	if err := rp.SendHeaders(ctx); err != nil {
+		t.Fatal(err)
+	}
+	s := &Syncer{wallet: newTestWallet(t)}
+	hash := forged.BlockHash()
+	if err := s.handleBlockInvs(ctx, rp, []*chainhash.Hash{&hash}); err == nil {
+		t.Fatal("forged block accepted")
+	}
+	if !disconnected(rp) {
+		t.Fatal("peer serving the forged block was not disconnected")
+	}
 }
 
 // txInvsWallet returns an unlocked wallet, the payment script of one of its

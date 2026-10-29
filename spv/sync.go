@@ -1084,11 +1084,12 @@ func (s *Syncer) handleBlockInvs(ctx context.Context, rp *p2p.RemotePeer, hashes
 		return nil
 	}
 
-	blocks, err := rp.Blocks(ctx, hashes)
+	blocks, err := blocksFromPeer(ctx, rp, hashes)
 	if err != nil {
 		op := errors.Opf(opf, rp)
 		return errors.E(op, err)
 	}
+
 	headers := make([]*wire.BlockHeader, len(blocks))
 	bmap := make(map[chainhash.Hash]*wire.MsgBlock)
 	for i, block := range blocks {
@@ -1365,24 +1366,12 @@ func (s *Syncer) scanChain(ctx context.Context, rp *p2p.RemotePeer, chain []*wal
 	wg.Wait()
 
 	if len(fmatches) != 0 {
-		blocks, err := rp.Blocks(ctx, fmatches)
+		blocks, err := blocksFromPeer(ctx, rp, fmatches)
 		if err != nil {
 			return nil, err
 		}
 		for j, b := range blocks {
 			i := fmatchidx[j]
-
-			// Perform context-free validation on the block.
-			// Disconnect peer when invalid.
-			err := validate.MerkleRoots(b)
-			if err != nil {
-				err = validate.DCP0005MerkleRoot(b)
-			}
-			if err != nil {
-				rp.Disconnect(err)
-				return nil, err
-			}
-
 			fetched[i] = b
 		}
 	}

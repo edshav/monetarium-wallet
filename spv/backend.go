@@ -59,6 +59,37 @@ func pickForGetCfilters(lastHeaderHeight int32) func(rp *p2p.RemotePeer) bool {
 	}
 }
 
+// blocksFromPeer requests blocks from rp and verifies the transaction trees in
+// the block match what is promised by the merkle commitment in the block
+// header.  The remote peer is disconnected if it returns a block that fails
+// this verification.
+func blocksFromPeer(ctx context.Context, rp *p2p.RemotePeer, blockHashes []*chainhash.Hash) ([]*wire.MsgBlock, error) {
+	blocks, err := rp.Blocks(ctx, blockHashes)
+	if err != nil {
+		return nil, err
+	}
+	for _, b := range blocks {
+		if b == nil {
+			continue
+		}
+
+		// A block hash only commits to the header, so a peer is free to return
+		// any transactions it likes for a requested hash and still satisfy the
+		// request. Every block obtained from a remote peer must therefore have
+		// its transaction trees checked against the merkle root commitments of
+		// the header before the transactions are used for anything.
+		err := validate.MerkleRoots(b)
+		if err != nil {
+			err = validate.DCP0005MerkleRoot(b)
+		}
+		if err != nil {
+			rp.Disconnect(err)
+			return nil, err
+		}
+	}
+	return blocks, nil
+}
+
 // Blocks implements the Blocks method of the wallet.Peer interface.
 func (s *Syncer) Blocks(ctx context.Context, blockHashes []*chainhash.Hash) ([]*wire.MsgBlock, error) {
 	for {
@@ -69,7 +100,7 @@ func (s *Syncer) Blocks(ctx context.Context, blockHashes []*chainhash.Hash) ([]*
 		if err != nil {
 			return nil, err
 		}
-		blocks, err := rp.Blocks(ctx, blockHashes)
+		blocks, err := blocksFromPeer(ctx, rp, blockHashes)
 		if err != nil {
 			log.Debugf("unable to fetch blocks from %v: %v", rp, err)
 			continue
@@ -553,32 +584,12 @@ func (s *Syncer) Rescan(ctx context.Context, blockHashes []chainhash.Hash, save 
 				return err
 			}
 
-			blocks, err := rp.Blocks(ctx, fmatches)
+			blocks, err := blocksFromPeer(ctx, rp, fmatches)
 			if err != nil {
 				continue PickPeer
 			}
 
 			for j, b := range blocks {
-				// Validate fetched blocks before rescanning transactions.  PoW
-				// and PoS difficulties have already been validated since the
-				// header is saved by the wallet, and modifications to these in
-				// the downloaded block would result in a different block hash
-				// and failure to fetch the block.
-				//
-				// Block filters were also validated
-				// against the header (assuming dcp0005
-				// was activated).
-				err = validate.MerkleRoots(b)
-				if err != nil {
-					err = validate.DCP0005MerkleRoot(b)
-				}
-				if err != nil {
-					err := errors.E(op, err)
-					rp.Disconnect(err)
-					rp = nil
-					continue PickPeer
-				}
-
 				i := fmatchidx[j]
 				blockMatches[i] = b
 			}
