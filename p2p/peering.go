@@ -41,11 +41,12 @@ const uaName = "monetarium-wallet"
 var uaVersion = version.String()
 
 // minPver is the minimum protocol version we require remote peers to
-// implement.
-const minPver = wire.RemoveRejectVersion
+// implement.  Below SKABigIntVersion, transactions are encoded without their
+// SKA amounts, and below DualCoinVersion without their coin types.
+const minPver = wire.SKABigIntVersion
 
 // Pver is the maximum protocol version implemented by the LocalPeer.
-const Pver = wire.BatchedCFiltersV2Version
+const Pver = wire.SKABigIntVersion
 
 // stallTimeout is the amount of time allowed before a request to receive data
 // that is known to exist at the RemotePeer times out with no matching reply.
