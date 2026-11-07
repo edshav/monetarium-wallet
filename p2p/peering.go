@@ -6,6 +6,7 @@ package p2p
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -160,6 +161,7 @@ type LocalPeer struct {
 	amgr           *addrmgr.AddrManager
 	chainParams    *chaincfg.Params
 	disableRelayTx bool
+	seederTLS      *tls.Config // nil except in tests, which serve a test certificate
 
 	rpByID map[uint64]*RemotePeer
 	rpMu   sync.Mutex
@@ -361,7 +363,8 @@ func (lp *LocalPeer) SeedPeers(ctx context.Context, services wire.ServiceFlag) {
 	resps := make(chan *http.Response)
 	client := http.Client{
 		Transport: &http.Transport{
-			DialContext: lp.dial,
+			DialContext:     lp.dial,
+			TLSClientConfig: lp.seederTLS,
 		},
 	}
 	cancels := make([]func(), 0, len(seeders))
@@ -436,12 +439,8 @@ func (lp *LocalPeer) SeedPeers(ctx context.Context, services wire.ServiceFlag) {
 				}
 				log.Debugf("Discovered peer %v from seeder %v", apiResponse.Host,
 					seeder)
-				na = append(na, &addrmgr.NetAddress{
-					IP:        ip,
-					Port:      uint16(portNum),
-					Timestamp: time.Now(),
-					Services:  wire.ServiceFlag(apiResponse.Services),
-				})
+				na = append(na, addrmgr.NewNetAddressFromIPPort(ip,
+					uint16(portNum), wire.ServiceFlag(apiResponse.Services)))
 			}
 		}()
 		if len(na) > 0 {
@@ -987,12 +986,9 @@ func (rp *RemotePeer) receivedPong(ctx context.Context, msg *wire.MsgPong) {
 func (rp *RemotePeer) receivedAddr(ctx context.Context, msg *wire.MsgAddr) {
 	addrs := make([]*addrmgr.NetAddress, len(msg.AddrList))
 	for i, a := range msg.AddrList {
-		addrs[i] = &addrmgr.NetAddress{
-			IP:        a.IP,
-			Port:      a.Port,
-			Services:  a.Services,
-			Timestamp: a.Timestamp,
-		}
+		na := addrmgr.NewNetAddressFromIPPort(a.IP, a.Port, a.Services)
+		na.Timestamp = a.Timestamp
+		addrs[i] = na
 	}
 	rp.lp.amgr.AddAddresses(addrs, rp.na)
 }

@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"math/big"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -166,4 +168,75 @@ func TestRejectsPeersWithoutSKAEncoding(t *testing.T) {
 	if !errors.Is(err, errors.Protocol) {
 		t.Fatalf("got %v, want a protocol error", err)
 	}
+}
+
+// The fixtures use a port other than the network's default, so that the port a
+// seeder or a relayer reports is seen to reach the manager.
+const seedAddrServices = wire.SFNodeNetwork | wire.SFNodeCF
+
+// checkHandedOut checks that the manager hands 1.2.3.4 and 2a01:4f8::1 to a
+// dialer that accepts only their type, the way spv asks for candidates, with
+// their services and a timestamp timeOK accepts.
+func checkHandedOut(t *testing.T, lp *LocalPeer, timeOK func(time.Time) bool) {
+	t.Helper()
+	for addrType, key := range map[addrmgr.NetAddressType]string{
+		addrmgr.IPv4Address: "1.2.3.4:19600",
+		addrmgr.IPv6Address: "[2a01:4f8::1]:19600",
+	} {
+		ka := lp.amgr.GetAddress(func(got addrmgr.NetAddressType) bool { return got == addrType })
+		if ka == nil {
+			t.Fatalf("no address of type %v", addrType)
+		}
+		na := ka.NetAddress()
+		if na.Key() != key {
+			t.Errorf("type %v: key %q, want %q", addrType, na.Key(), key)
+		}
+		if na.Services != seedAddrServices {
+			t.Errorf("%v: services %v, want %v", key, na.Services, seedAddrServices)
+		}
+		if !timeOK(na.Timestamp) {
+			t.Errorf("%v: unexpected timestamp %v", key, na.Timestamp)
+		}
+	}
+}
+
+func TestSeedPeersAddressesHaveType(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"host":"1.2.3.4:19600","services":%[1]d,"pver":14}
+{"host":"[2a01:4f8::1]:19600","services":%[1]d,"pver":14}
+`, seedAddrServices)
+	}))
+	defer srv.Close()
+
+	lp := NewLocalPeer(chaincfg.TestNet3Params(), nil, addrmgr.New(t.TempDir()))
+	lp.SetDialFunc(func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return new(net.Dialer).DialContext(ctx, network, srv.Listener.Addr().String())
+	})
+	lp.seederTLS = srv.Client().Transport.(*http.Transport).TLSClientConfig.Clone()
+	lp.seederTLS.ServerName = "example.com" // the name in httptest's certificate
+
+	start := time.Now().Truncate(time.Second)
+	lp.SeedPeers(context.Background(), wire.SFNodeNetwork)
+
+	checkHandedOut(t, lp, func(ts time.Time) bool { return !ts.Before(start) && !ts.After(time.Now()) })
+}
+
+func TestReceivedAddrAddressesHaveType(t *testing.T) {
+	lp := NewLocalPeer(chaincfg.TestNet3Params(), nil, addrmgr.New(t.TempDir()))
+	rp := &RemotePeer{lp: lp, na: addrmgr.NewNetAddressFromIPPort(net.ParseIP("5.6.7.8"), 19600, seedAddrServices)}
+
+	// A relayed address is as fresh as the relayer says, not as the moment it
+	// arrived.  Decoded from the wire, its IP is always 16 bytes.
+	seen := time.Now().Add(-3 * time.Hour).Truncate(time.Second)
+	msg := wire.NewMsgAddr()
+	for _, ip := range []string{"1.2.3.4", "2a01:4f8::1"} {
+		a := wire.NewNetAddressIPPort(net.ParseIP(ip), 19600, seedAddrServices)
+		a.Timestamp = seen
+		if err := msg.AddAddress(a); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rp.receivedAddr(context.Background(), msg)
+
+	checkHandedOut(t, lp, seen.Equal)
 }
