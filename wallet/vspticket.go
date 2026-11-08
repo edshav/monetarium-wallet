@@ -240,6 +240,13 @@ func (v *VSPTicket) Spent(ctx context.Context) bool {
 	return err == nil
 }
 
+// Pruned reports whether the wallet no longer has the ticket, e.g. an unmined
+// ticket pruned at its expiry height.
+func (v *VSPTicket) Pruned(ctx context.Context) bool {
+	_, err := v.TxBlock(ctx)
+	return errors.Is(err, errors.NotExist)
+}
+
 func (v *VSPTicket) TxBlock(ctx context.Context) (int32, error) {
 	_, height, err := v.wallet.TxBlock(ctx, v.hash)
 	return height, err

@@ -23,7 +23,8 @@ import (
 )
 
 var (
-	errStopped = errors.New("fee processing stopped")
+	errStopped    = errors.New("fee processing stopped")
+	errFeeTooHigh = errors.New("server fee amount too high")
 )
 
 // A random amount of delay (between zero and these jitter constants) is added
@@ -71,6 +72,12 @@ const (
 func (fp *vspFeePayment) removedExpiredOrSpent() bool {
 	var reason string
 	switch {
+	case fp.ticket.Pruned(fp.ctx):
+		// Checked first: the expiry of a ticket the wallet no longer has
+		// cannot be computed.  The VSP record stays: a ticket pruned by
+		// mistake can still be mined, and a later Process call then
+		// resumes its payment.
+		reason = "pruned"
 	case fp.ticket.Expired(fp.ctx):
 		reason = "expired"
 	case fp.ticket.Spent(fp.ctx):
@@ -273,7 +280,7 @@ func (fp *vspFeePayment) receiveFeeAddress() error {
 
 	fp.client.log.Infof("VSP requires fee %v", feeAmount)
 	if feeAmount > fp.policy.MaxFee {
-		return fmt.Errorf("server fee amount too high: %v > %v",
+		return fmt.Errorf("%w: %v > %v", errFeeTooHigh,
 			feeAmount, fp.policy.MaxFee)
 	}
 
@@ -395,9 +402,7 @@ func (c *VSPClient) setVoteChoices(ctx context.Context, ticket *VSPTicket,
 func (fp *vspFeePayment) reconcilePayment() error {
 	ctx := fp.ctx
 
-	// stop processing if ticket is expired or spent
-	// TODO: if the ticket is no longer saved by the wallet (tx expired,
-	// double-spent, etc) remove the fee payment.
+	// stop processing if ticket is expired, spent or pruned
 	if fp.removedExpiredOrSpent() {
 		// nothing scheduled
 		return errStopped
@@ -417,21 +422,33 @@ func (fp *vspFeePayment) reconcilePayment() error {
 		if err != nil {
 			var apiErr types.ErrorResponse
 			isAPIErr := errors.As(err, &apiErr)
+			// A concurrent Process call made a fee tx meanwhile: a
+			// made fee tx sets a new hash; one the VSP finds invalid
+			// or cannot broadcast zeroes it.
+			fp.mu.Lock()
+			made := fp.feeHash != startHash && fp.feeHash != (chainhash.Hash{})
+			fp.mu.Unlock()
 			switch {
 			case isAPIErr && apiErr.Code == types.ErrTicketCannotVote:
 				fp.remove("ticket cannot vote")
 			case isAPIErr && apiErr.Code == types.ErrFeeAlreadyReceived,
 				errors.Is(err, errStopped):
 				// Nothing to retry.
+			case errors.Is(err, errFeeTooHigh) && !made:
+				// Retrying every few minutes is not worth it.  Mark the
+				// fee errored so that a later Process call for the
+				// ticket retries it.
+				if markErr := fp.ticket.UpdateFeeErrored(ctx, fp.client.URL, fp.client.PubKey); markErr != nil {
+					fp.client.log.Errorf("Ticket %v: mark fee errored: %v", fp.ticket, markErr)
+				}
+				fp.remove("VSP fee above the configured maximum")
 			default:
 				// Try again, as with failures to submit the payment.
 				// Unless a concurrent Process call made a fee tx
 				// meanwhile, ask the VSP for the fee again, as it may
 				// have received one, and start from a new fee tx: the
 				// failed one may be half built, or hold inputs a ticket
-				// purchase has since unlocked.  A made fee tx sets a
-				// new hash; one the VSP finds invalid or cannot
-				// broadcast zeroes it.
+				// purchase has since unlocked.
 				fp.mu.Lock()
 				if fp.feeHash == startHash || fp.feeHash == (chainhash.Hash{}) {
 					fp.fee = 0
