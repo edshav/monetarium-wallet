@@ -4433,7 +4433,7 @@ func (s *walletServer) SetVspdVoteChoices(ctx context.Context, req *pb.SetVspdVo
 		if err != nil {
 			return err
 		}
-		if ticketHost == req.VspHost {
+		if wallet.SameVSPHost(ticketHost, req.VspHost) {
 			ticket, err := s.wallet.NewVSPTicket(ctx, hash)
 			if err != nil {
 				return err

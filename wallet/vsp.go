@@ -266,7 +266,7 @@ func (c *VSPClient) Process(ctx context.Context, ticket *VSPTicket, feeTx *wire.
 		return fp.submitPayment()
 	case udb.VSPFeeProcessPaid:
 		// If a VSP ticket has been paid, but confirm payment.
-		if len(vspTicket.Host) > 0 && vspTicket.Host != c.Client.URL {
+		if len(vspTicket.Host) > 0 && !SameVSPHost(vspTicket.Host, c.Client.URL) {
 			// Cannot confirm a paid ticket that is already with another VSP.
 			return fmt.Errorf("ticket already paid or confirmed with another vsp")
 		}
