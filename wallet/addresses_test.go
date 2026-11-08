@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"sync"
 	"testing"
 
 	"github.com/monetarium/monetarium-node/chaincfg"
@@ -373,4 +374,196 @@ func TestXpubAddressPubKeyError(t *testing.T) {
 			t.Fatal("expected non-empty pubkey")
 		}
 	})
+}
+
+// TestCurrentAddressAndPersist checks that getaccountaddress returns the same
+// address on every call until it is used, a new address is returned or the
+// wallet restarts.  Advancing on every call would use up the gap limit, and
+// payments beyond it are not found when the wallet is restored from seed.  The
+// address is the one CurrentAddress reports, getaddressesbyaccount lists it,
+// and getnewaddress never returns it.
+func TestCurrentAddressAndPersist(t *testing.T) {
+	ctx := context.Background()
+	cfg := basicWalletConfig
+	w, teardown := testWallet(ctx, t, &cfg, nil)
+	defer teardown()
+
+	w.addressBuffersMu.Lock()
+	xbranch := w.addressBuffers[0].albExternal.branchXpub
+	w.addressBuffersMu.Unlock()
+	child := func(i uint32) string {
+		addr, err := deriveChildAddress(xbranch, i, cfg.Params)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return addr.String()
+	}
+	current := func(want uint32) {
+		t.Helper()
+		addr, err := w.CurrentAddressAndPersist(ctx, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if addr.String() != child(want) {
+			t.Fatalf("current address %v, want child %d (%v)", addr, want, child(want))
+		}
+		peek, err := w.CurrentAddress(0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if peek.String() != addr.String() {
+			t.Fatalf("CurrentAddress %v after getaccountaddress returned %v", peek, addr)
+		}
+		// getaddressesbyaccount lists the children below this index.
+		ext, _, err := w.BIP0044BranchNextIndexes(ctx, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ext <= want {
+			t.Fatalf("getaddressesbyaccount lists children below %d, not child %d", ext, want)
+		}
+	}
+
+	for range 2 * cfg.GapLimit {
+		current(0)
+	}
+	addr, err := w.NewExternalAddress(ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if addr.String() != child(1) {
+		t.Fatalf("new address %v, want child 1 (%v)", addr, child(1))
+	}
+	current(2)
+	current(2)
+
+	// The address is kept in memory only, so a restart moves it on.
+	w, err = Open(ctx, &cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.SetNetworkBackend(mockNetwork{})
+	current(3)
+	current(3)
+
+	useAddress(3)(ctx, t, w)
+	current(4)
+	current(4)
+}
+
+// TestCurrentAddressAndPersistGapLimit checks that, with the gap limit's
+// worth of unused addresses already returned, getaccountaddress returns none of
+// them and leaves the cursor every caller shares where it was.
+func TestCurrentAddressAndPersistGapLimit(t *testing.T) {
+	ctx := context.Background()
+	cfg := basicWalletConfig
+	w, teardown := testWallet(ctx, t, &cfg, nil)
+	defer teardown()
+
+	returned := make(map[string]bool)
+	for range cfg.GapLimit {
+		addr, err := w.NewExternalAddress(ctx, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		returned[addr.String()] = true
+	}
+	addr, err := w.CurrentAddressAndPersist(ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if returned[addr.String()] {
+		t.Fatalf("getaccountaddress returned %v, already returned by getnewaddress", addr)
+	}
+	ext, _, err := w.BIP0044BranchNextIndexes(ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ext != cfg.GapLimit+1 {
+		t.Fatalf("next external index %d, want %d", ext, cfg.GapLimit+1)
+	}
+}
+
+// TestCurrentAddressAndPersistAccounts checks that a new address on one
+// account leaves the address getaccountaddress returns on another alone.
+func TestCurrentAddressAndPersistAccounts(t *testing.T) {
+	ctx := context.Background()
+	cfg := basicWalletConfig
+	cfg.AccountGapLimit = 2
+	w, teardown := testWallet(ctx, t, &cfg, nil)
+	defer teardown()
+	if err := w.Unlock(ctx, testPrivPass, nil); err != nil {
+		t.Fatal(err)
+	}
+	acct, err := w.NextAccount(ctx, "second")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want, err := w.CurrentAddressAndPersist(ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.CurrentAddressAndPersist(ctx, acct); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.NewExternalAddress(ctx, acct); err != nil {
+		t.Fatal(err)
+	}
+	got, err := w.CurrentAddressAndPersist(ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.String() != want.String() {
+		t.Fatalf("account 0 address moved from %v to %v after a new address on account %d", want, got, acct)
+	}
+}
+
+// TestCurrentAddressAndPersistConcurrent checks that concurrent getaccountaddress
+// and getnewaddress calls never return one address to both.
+func TestCurrentAddressAndPersistConcurrent(t *testing.T) {
+	ctx := context.Background()
+	cfg := basicWalletConfig
+	w, teardown := testWallet(ctx, t, &cfg, nil)
+	defer teardown()
+
+	var mu sync.Mutex
+	current := make(map[string]bool)
+	fresh := make(map[string]bool)
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			for range 10 {
+				addr, err := w.CurrentAddressAndPersist(ctx, 0)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				mu.Lock()
+				current[addr.String()] = true
+				mu.Unlock()
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for range 5 {
+				addr, err := w.NewExternalAddress(ctx, 0, WithGapPolicyIgnore())
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				mu.Lock()
+				fresh[addr.String()] = true
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	for addr := range current {
+		if fresh[addr] {
+			t.Errorf("%v returned by both getaccountaddress and getnewaddress", addr)
+		}
+	}
 }

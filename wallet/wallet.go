@@ -2800,7 +2800,10 @@ func (w *Wallet) CurrentAddress(account uint32) (stdaddr.Address, error) {
 	}
 	buf := &data.albExternal
 
-	childIndex := buf.lastUsed + 1 + buf.cursor
+	childIndex, ok := buf.currentChild()
+	if !ok {
+		childIndex = buf.lastUsed + 1 + buf.cursor
+	}
 	child, err := buf.branchXpub.Child(childIndex)
 	if err != nil {
 		return nil, errors.E(op, err)
@@ -2821,46 +2824,41 @@ func (w *Wallet) CurrentAddress(account uint32) (stdaddr.Address, error) {
 func (w *Wallet) CurrentAddressAndPersist(ctx context.Context, account uint32) (stdaddr.Address, error) {
 	const op errors.Op = "wallet.CurrentAddressAndPersist"
 
-	// Get the child index and derive the address while holding the lock
+	// Return the address handed out here last while it is unused: a new one
+	// on every call would use up the gap limit.
 	w.addressBuffersMu.Lock()
 	data, ok := w.addressBuffers[account]
 	if !ok {
 		w.addressBuffersMu.Unlock()
 		return nil, errors.E(op, errors.NotExist, errors.Errorf("no account %d", account))
 	}
-	buf := &data.albExternal
-	childIndex := buf.lastUsed + 1 + buf.cursor
-
-	// Derive the address
-	child, err := buf.branchXpub.Child(childIndex)
-	if err != nil {
+	if childIndex, ok := data.albExternal.currentChild(); ok {
+		child, err := data.albExternal.branchXpub.Child(childIndex)
 		w.addressBuffersMu.Unlock()
-		return nil, errors.E(op, err)
-	}
-	addr, err := compat.HD2Address(child, w.chainParams)
-	if err != nil {
-		w.addressBuffersMu.Unlock()
-		return nil, errors.E(op, err)
-	}
-
-	// Persist the address to the database
-	err = walletdb.Update(ctx, w.db, func(tx walletdb.ReadWriteTx) error {
-		ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-		// Sync the address to the database
-		err := w.manager.SyncAccountToAddrIndex(ns, account, childIndex, udb.ExternalBranch)
 		if err != nil {
-			return err
+			return nil, errors.E(op, err)
 		}
-		// Mark it as returned
-		return w.manager.MarkReturnedChildIndex(tx, account, udb.ExternalBranch, childIndex)
-	})
+		addr, err := compat.HD2Address(child, w.chainParams)
+		if err != nil {
+			return nil, errors.E(op, err)
+		}
+		return addr, nil
+	}
+	w.addressBuffersMu.Unlock()
+
+	// Otherwise hand out a new address, which syncs it to the address index
+	// and records it returned.  As before, it may pass the gap limit: the
+	// ignore policy then watches it, where wrapping would reset the cursor
+	// that every caller shares.
+	addr, err := w.NewExternalAddress(ctx, account, WithGapPolicyIgnore())
 	if err != nil {
-		w.addressBuffersMu.Unlock()
 		return nil, errors.E(op, err)
 	}
-
-	// Increment cursor to mark this address as returned
-	buf.cursor++
+	w.addressBuffersMu.Lock()
+	if data, ok := w.addressBuffers[account]; ok {
+		data.albExternal.current = addr.(*xpubAddress).child
+		data.albExternal.haveCurrent = true
+	}
 	w.addressBuffersMu.Unlock()
 
 	return addr, nil

@@ -458,6 +458,17 @@ type addressBuffer struct {
 	// to children beyond the last returned child recorded in the database.
 	cursor      uint32
 	lastWatched uint32
+	// current is the child getaccountaddress returned, kept in memory
+	// only.  It is valid while haveCurrent and unused, and
+	// NewExternalAddress clears it.
+	current     uint32
+	haveCurrent bool
+}
+
+// currentChild returns the child getaccountaddress returned while it is
+// unused, and false otherwise.
+func (b *addressBuffer) currentChild() (uint32, bool) {
+	return b.current, b.haveCurrent && b.current+1 > b.lastUsed+1
 }
 
 type bip0044AccountData struct {
@@ -741,8 +752,18 @@ func (w *Wallet) NewExternalAddress(ctx context.Context, account uint32, callOpt
 	}
 
 	accountName, _ := w.AccountName(ctx, account)
-	return w.nextAddress(ctx, op, w.persistReturnedChild(ctx, nil),
+	addr, err := w.nextAddress(ctx, op, w.persistReturnedChild(ctx, nil),
 		accountName, account, udb.ExternalBranch, callOpts...)
+	if err != nil {
+		return nil, err
+	}
+	// A requested new address replaces the one getaccountaddress returns.
+	w.addressBuffersMu.Lock()
+	if ad, ok := w.addressBuffers[account]; ok {
+		ad.albExternal.haveCurrent = false
+	}
+	w.addressBuffersMu.Unlock()
+	return addr, nil
 }
 
 // NewInternalAddress returns an internal address.
