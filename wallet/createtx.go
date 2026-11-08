@@ -1662,6 +1662,13 @@ func (w *Wallet) individualSplit(ctx context.Context, req *PurchaseTicketsReques
 
 var errVSPFeeRequiresUTXOSplit = errors.New("paying VSP fee requires UTXO split")
 
+// ErrVSPFeeNotPaid is joined into the error PurchaseTickets returns when the
+// tickets were published but the VSP fee for one or more of them was not paid
+// by that call.  The response is non-nil and holds every published ticket
+// hash.  The fee may still be paid: the wallet can have scheduled a retry, or
+// the VSP may have received it.
+var ErrVSPFeeNotPaid = errors.New("tickets published but VSP fee not paid")
+
 // purchaseTickets indicates to the wallet that a ticket should be purchased
 // using all currently available funds.   Also, when the spend limit in the
 // request is greater than or equal to 0, tickets that cost more than that limit
@@ -2207,20 +2214,19 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 		err = req.VSPClient.Process(ctx, ticket, feeTx)
 		if err != nil {
 			unlock()
-			// Ticket is already on-chain. Keep publishing the rest;
-			// fees can be retried via ProcessUnpaidVSPTickets.
-			log.Errorf("VSP fee for published ticket %v failed: %v", ticketHash, err)
-			feeErrs = append(feeErrs, err)
+			// The ticket is already published. Keep publishing the
+			// rest; the wallet may retry the fee itself, or it can be
+			// paid with processunmanagedticket.
+			if err != nil {
+				log.Errorf("VSP fee for published ticket %v failed: %v", ticketHash, err)
+				feeErrs = append(feeErrs, err)
+			}
 			continue
-		}
-		// Record is only used as a sanity check; the fee tx is already
-		// in the wallet via CreateVspPayment. Never drop published hashes.
-		if _, recErr := udb.NewTxRecordFromMsgTx(feeTx, time.Now()); recErr != nil {
-			log.Errorf("fee tx record for %v: %v", ticketHash, recErr)
 		}
 	}
 
 	if len(feeErrs) > 0 {
+		feeErrs = append([]error{ErrVSPFeeNotPaid}, feeErrs...)
 		return purchaseTicketsResponse, errors.E(op, errors.Join(feeErrs...))
 	}
 	return purchaseTicketsResponse, nil
