@@ -125,19 +125,46 @@ func (w *Wallet) NewUnsignedTransaction(ctx context.Context, outputs []*wire.TxO
 		txCoinType = outputs[0].CoinType
 	}
 	return w.newUnsignedTransactionWithCoinType(ctx, txCoinType, outputs,
-		relayFeePerKbOverride, account, minConf, algo, changeSource, inputSource)
+		relayFeePerKbOverride, account, minConf, algo, changeSource, inputSource, -1)
+}
+
+// NewUnsignedTransactionWithSFFA is NewUnsignedTransaction plus Bitcoin-Core
+// "subtractfeefromamount" semantics: when subtractFeeFromAmountIdx >= 0, the
+// converged transaction fee is deducted from the value of that output (the
+// recipient receives the requested amount minus the fee, and the sender's
+// outlay is exactly the requested amount) instead of from the change. Pass -1
+// to disable, which is exactly NewUnsignedTransaction's behavior.
+func (w *Wallet) NewUnsignedTransactionWithSFFA(ctx context.Context, outputs []*wire.TxOut,
+	relayFeePerKbOverride cointype.SKAAmount, account uint32, minConf int32,
+	algo OutputSelectionAlgorithm, changeSource txauthor.ChangeSource, inputSource txauthor.InputSource,
+	subtractFeeFromAmountIdx int) (*txauthor.AuthoredTx, error) {
+
+	txCoinType := cointype.CoinTypeVAR
+	if len(outputs) > 0 {
+		txCoinType = outputs[0].CoinType
+	}
+	return w.newUnsignedTransactionWithCoinType(ctx, txCoinType, outputs,
+		relayFeePerKbOverride, account, minConf, algo, changeSource, inputSource,
+		subtractFeeFromAmountIdx)
 }
 
 // NewUnsignedSweepTransactionForCoinType is the coin-type-aware sweep variant
 // of NewUnsignedTransaction. It accepts no outputs (the destination receives
 // the swept amount minus fees via changeSource) and requires the caller to
 // specify the coin type explicitly so SKA accounts can be swept.
+//
+// inputSource is optional: nil sweeps every eligible UTXO of txCoinType in
+// the account (the shared implementation wraps the store's coin-typed source
+// with the drain-all sentinel). A non-nil source restricts the sweep to
+// whatever that source returns — used for "send Max from a manual UTXO
+// selection", which must sweep exactly the hand-picked set and nothing else.
 func (w *Wallet) NewUnsignedSweepTransactionForCoinType(ctx context.Context,
 	txCoinType cointype.CoinType, relayFeePerKbOverride cointype.SKAAmount,
-	account uint32, minConf int32, changeSource txauthor.ChangeSource) (*txauthor.AuthoredTx, error) {
+	account uint32, minConf int32, changeSource txauthor.ChangeSource,
+	inputSource txauthor.InputSource) (*txauthor.AuthoredTx, error) {
 
 	return w.newUnsignedTransactionWithCoinType(ctx, txCoinType, nil,
-		relayFeePerKbOverride, account, minConf, OutputSelectionAlgorithmAll, changeSource, nil)
+		relayFeePerKbOverride, account, minConf, OutputSelectionAlgorithmAll, changeSource, inputSource, -1)
 }
 
 // newUnsignedTransactionWithCoinType is the shared implementation behind
@@ -146,7 +173,8 @@ func (w *Wallet) NewUnsignedSweepTransactionForCoinType(ctx context.Context,
 func (w *Wallet) newUnsignedTransactionWithCoinType(ctx context.Context,
 	txCoinType cointype.CoinType, outputs []*wire.TxOut,
 	relayFeePerKbOverride cointype.SKAAmount, account uint32, minConf int32,
-	algo OutputSelectionAlgorithm, changeSource txauthor.ChangeSource, inputSource txauthor.InputSource) (*txauthor.AuthoredTx, error) {
+	algo OutputSelectionAlgorithm, changeSource txauthor.ChangeSource, inputSource txauthor.InputSource,
+	subtractFeeFromAmountIdx int) (*txauthor.AuthoredTx, error) {
 
 	const op errors.Op = "wallet.NewUnsignedTransaction"
 
@@ -227,7 +255,7 @@ func (w *Wallet) newUnsignedTransactionWithCoinType(ctx context.Context,
 				inputSource, changeSource, w.chainParams.MaxTxSize)
 		} else {
 			authoredTx, err = txauthor.NewUnsignedTransaction(outputs, actualRelayFee,
-				inputSource, changeSource, w.chainParams.MaxTxSize, -1)
+				inputSource, changeSource, w.chainParams.MaxTxSize, subtractFeeFromAmountIdx)
 		}
 		if err != nil {
 			return err

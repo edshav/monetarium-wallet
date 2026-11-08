@@ -7278,7 +7278,7 @@ func (s *Server) sweepAccount(ctx context.Context, icmd any) (any, error) {
 		return nil, err
 	}
 	tx, err := w.NewUnsignedSweepTransactionForCoinType(ctx, sweepCoinType,
-		feePerKbOverride, account, requiredConfs, changeSource)
+		feePerKbOverride, account, requiredConfs, changeSource, nil)
 	if err != nil {
 		if errors.Is(err, errors.InsufficientBalance) {
 			return nil, rpcError(dcrjson.ErrRPCWalletInsufficientFunds, err)

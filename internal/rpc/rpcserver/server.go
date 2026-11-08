@@ -1072,7 +1072,7 @@ func (s *walletServer) SweepAccount(ctx context.Context, req *pb.SweepAccountReq
 	}
 
 	tx, err := s.wallet.NewUnsignedSweepTransactionForCoinType(ctx, sweepCoinType,
-		feePerKbOverride, account, int32(req.RequiredConfirmations), changeSource)
+		feePerKbOverride, account, int32(req.RequiredConfirmations), changeSource, nil)
 	if err != nil {
 		return nil, translateError(err)
 	}
