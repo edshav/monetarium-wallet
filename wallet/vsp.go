@@ -209,7 +209,8 @@ func (c *VSPClient) ProcessManagedTickets(ctx context.Context, tickets []*VSPTic
 // hash is associated with the ticket.  On error the caller should unlock the
 // inputs of feeTx.  The fee payment keeps feeTx only if a scheduled attempt
 // made its own fee tx in it meanwhile, which the wallet records as spending
-// those inputs.
+// those inputs.  If the VSP already holds a fee tx for the ticket, that one is
+// recorded and confirmed, and feeTx is left unused.
 func (c *VSPClient) Process(ctx context.Context, ticket *VSPTicket, feeTx *wire.MsgTx) error {
 	vspTicket, err := ticket.VSPTicketInfo(ctx)
 	if err != nil && !errors.Is(err, errors.NotExist) {
@@ -239,6 +240,9 @@ func (c *VSPClient) Process(ctx context.Context, ticket *VSPTicket, feeTx *wire.
 		startHash := fp.feeHash
 		fp.mu.Unlock()
 		feeErr := fp.receiveFeeAddress()
+		if isFeeAlreadyReceived(feeErr) {
+			return fp.recordReceivedFee()
+		}
 		if feeErr == nil {
 			feeErr = fp.makeFeeTx(feeTx)
 		}

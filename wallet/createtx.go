@@ -2201,8 +2201,10 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 			continue
 		}
 
+		// Process may also succeed without feeTx, when the VSP already
+		// holds a fee tx for the ticket.
 		err = req.VSPClient.Process(ctx, ticket, feeTx)
-		if err != nil {
+		if err != nil || len(feeTx.TxOut) == 0 {
 			unlock()
 			continue
 		}

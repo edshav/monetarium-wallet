@@ -144,6 +144,9 @@ func (c *VSPClient) feePayment(ctx context.Context, ticket *VSPTicket, paidConfi
 		return fp
 	}
 
+	// Confirming a fee the VSP holds needs its hash even when the wallet
+	// lacks the fee tx, e.g. one paid before a restore from seed.
+	fp.feeHash = feeHash
 	fee, err := ticket.FeeTx(ctx)
 	if err != nil {
 		// A fee hash is recorded for this ticket, but was not found in
@@ -157,7 +160,6 @@ func (c *VSPClient) feePayment(ctx context.Context, ticket *VSPTicket, paidConfi
 	}
 
 	fp.feeTx = fee
-	fp.feeHash = feeHash
 
 	// If database has been updated to paid or confirmed status, we can forgo
 	// this step.
@@ -420,8 +422,9 @@ func (fp *vspFeePayment) reconcilePayment() error {
 			switch {
 			case isAPIErr && apiErr.Code == types.ErrTicketCannotVote:
 				fp.remove("ticket cannot vote")
-			case isAPIErr && apiErr.Code == types.ErrFeeAlreadyReceived,
-				errors.Is(err, errStopped):
+			case isAPIErr && apiErr.Code == types.ErrFeeAlreadyReceived:
+				return fp.recordReceivedFee()
+			case errors.Is(err, errStopped):
 				// Nothing to retry.
 			default:
 				// Try again, as with failures to submit the payment.
@@ -498,6 +501,47 @@ func (fp *vspFeePayment) reconcilePayment() error {
 		// outpoints as it is processed.
 
 	*/
+}
+
+// isFeeAlreadyReceived reports whether err is the VSP saying it already holds
+// a fee tx for the ticket.
+func isFeeAlreadyReceived(err error) bool {
+	var apiErr types.ErrorResponse
+	return errors.As(err, &apiErr) && apiErr.Code == types.ErrFeeAlreadyReceived
+}
+
+// recordReceivedFee records the fee tx the VSP already holds for the ticket as
+// paid, and confirms it.  The VSP answers a fee address request with
+// ErrFeeAlreadyReceived once it holds a fee tx, for example one paid before the
+// wallet was restored from seed.  The job stops using its own fee tx and fee
+// quote, so a retry asks the VSP again; the fee tx itself stays in the wallet.
+func (fp *vspFeePayment) recordReceivedFee() error {
+	ctx := fp.ctx
+
+	fp.mu.Lock()
+	fp.feeTx = nil
+	fp.fee = 0
+	fp.mu.Unlock()
+
+	status, err := fp.client.status(ctx, fp.ticket)
+	var feeHash *chainhash.Hash
+	if err == nil {
+		feeHash, err = chainhash.NewHashFromStr(status.FeeTxHash)
+	}
+	if err == nil && *feeHash == (chainhash.Hash{}) {
+		err = fmt.Errorf("VSP reports a received fee but no fee tx hash")
+	}
+	if err == nil {
+		fp.mu.Lock()
+		fp.feeHash = *feeHash
+		fp.mu.Unlock()
+		err = fp.ticket.UpdateFeePaid(ctx, *feeHash, fp.client.URL, fp.client.PubKey)
+	}
+	if err != nil {
+		fp.schedule("reconcile payment", fp.reconcilePayment)
+		return err
+	}
+	return fp.confirmPayment()
 }
 
 func (fp *vspFeePayment) submitPayment() (err error) {

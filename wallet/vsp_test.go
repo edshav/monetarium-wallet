@@ -173,7 +173,8 @@ func TestVSPExpiredFeeRequestsNewQuote(t *testing.T) {
 
 // TestVSPReconcileRetriesWhenFeeTxFails checks that a failure to create the
 // fee transaction schedules another attempt with a new fee transaction, unless
-// the VSP says the ticket can never vote or already has its fee.
+// the VSP says the ticket can never vote.  When the VSP says it already has the
+// fee but cannot report it, the retry asks again.
 func TestVSPReconcileRetriesWhenFeeTxFails(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -182,7 +183,7 @@ func TestVSPReconcileRetriesWhenFeeTxFails(t *testing.T) {
 	}{
 		{"VSP error", types.ErrInternalError, true},
 		{"ticket cannot vote", types.ErrTicketCannotVote, false},
-		{"fee already received", types.ErrFeeAlreadyReceived, false},
+		{"fee already received", types.ErrFeeAlreadyReceived, true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
