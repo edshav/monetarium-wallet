@@ -238,3 +238,62 @@ func TestNewUnsignedTransaction(t *testing.T) {
 		}
 	}
 }
+
+// TestChangelessDeadZoneRescue exercises the band between "inputs cover
+// outputs + change-less fee" and "inputs cover outputs + with-change fee".
+// The input source is exhausted inside that band, and before the rescue the
+// author failed InsufficientBalance even though a valid, relayable
+// change-less transaction exists — user-visible as "reducing a Max-filled
+// amount by a few atoms makes a SMALLER send insufficient". The rescue must
+// author without a change output, keep the recipient amount untouched, and
+// burn the whole leftover as fee (bounded overpay: less than the fee cost
+// of carrying the change output). Below the change-less minimum the real
+// InsufficientBalance verdict must be preserved.
+func TestChangelessDeadZoneRescue(t *testing.T) {
+	relayFee := cointype.SKAAmountFromInt64(1e3)
+	amount := dcrutil.Amount(1e8)
+	outputs := p2pkhOutputs(amount)
+	inputSizes := []int{txsizes.RedeemP2PKHSigScriptSize}
+	changelessFee := txrules.FeeForSerializeSize(1e3,
+		txsizes.EstimateSerializeSize(inputSizes, outputs, 0))
+	withChangeFee := txrules.FeeForSerializeSize(1e3,
+		txsizes.EstimateSerializeSize(inputSizes, outputs, txsizes.P2PKHPkScriptSize))
+	if changelessFee >= withChangeFee {
+		t.Fatalf("test shape broken: changeless fee %v >= with-change fee %v",
+			changelessFee, withChangeFee)
+	}
+
+	// One atom past the change-less minimum: inside the dead zone.
+	leftover := changelessFee + 1
+	if leftover >= withChangeFee {
+		t.Fatalf("test shape broken: leftover %v >= with-change fee %v",
+			leftover, withChangeFee)
+	}
+	unspents := p2pkhOutputs(amount + leftover)
+	tx, err := txauthor.NewUnsignedTransaction(outputs, relayFee,
+		makeInputSource(unspents), AuthorTestChangeSource{},
+		chaincfg.MainNetParams().MaxTxSize, -1)
+	if err != nil {
+		t.Fatalf("dead-zone rescue failed: %v", err)
+	}
+	if tx.ChangeIndex >= 0 {
+		t.Fatalf("rescue tx must have no change output, got index %d", tx.ChangeIndex)
+	}
+	if len(tx.Tx.TxOut) != 1 || tx.Tx.TxOut[0].Value != int64(amount) {
+		t.Fatalf("recipient output mutated: %+v", tx.Tx.TxOut)
+	}
+	fee := tx.TotalInput - dcrutil.Amount(tx.Tx.TxOut[0].Value)
+	if fee != leftover {
+		t.Fatalf("fee = %v, want the whole leftover %v", fee, leftover)
+	}
+
+	// One atom below the change-less minimum: not fundable in any shape —
+	// the rescue must not relax the InsufficientBalance verdict.
+	shortUnspents := p2pkhOutputs(amount + changelessFee - 1)
+	_, err = txauthor.NewUnsignedTransaction(outputs, relayFee,
+		makeInputSource(shortUnspents), AuthorTestChangeSource{},
+		chaincfg.MainNetParams().MaxTxSize, -1)
+	if !errors.Is(err, errors.InsufficientBalance) {
+		t.Fatalf("below-minimum send: want InsufficientBalance, got %v", err)
+	}
+}

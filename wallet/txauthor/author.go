@@ -316,6 +316,15 @@ func newUnsignedTransaction(coinType cointype.CoinType, outputs []*wire.TxOut,
 				required = targetSKAAmount.Add(targetFeeSKA)
 			}
 			if inputDetail.SKAAmount.Cmp(required) < 0 {
+				// The source is exhausted (it returned everything it had,
+				// short of outputs + fee-with-change). Before failing, try
+				// the change-less shape — see changelessRescue.
+				if !subtractFee {
+					if tx := changelessRescue(coinType, outputs, relayFeePerKb,
+						inputDetail, targetAmount, targetSKAAmount, maxTxSize); tx != nil {
+						return tx, nil
+					}
+				}
 				return nil, errors.E(op, errors.InsufficientBalance)
 			}
 		} else {
@@ -324,6 +333,13 @@ func newUnsignedTransaction(coinType cointype.CoinType, outputs []*wire.TxOut,
 				required = targetAmount + targetFee
 			}
 			if inputDetail.Amount < required {
+				// Same change-less rescue as the SKA branch above.
+				if !subtractFee {
+					if tx := changelessRescue(coinType, outputs, relayFeePerKb,
+						inputDetail, targetAmount, targetSKAAmount, maxTxSize); tx != nil {
+						return tx, nil
+					}
+				}
 				return nil, errors.E(op, errors.InsufficientBalance)
 			}
 		}
@@ -576,6 +592,91 @@ func newUnsignedTransaction(coinType cointype.CoinType, outputs []*wire.TxOut,
 			ChangeIndex:                  changeIndex,
 			EstimatedSignedSerializeSize: maxSignedSize,
 		}, nil
+	}
+}
+
+// changelessRescue authors the transaction WITHOUT a change output when the
+// input source is exhausted — it returned everything it had, which is short
+// of outputs + fee-for-a-change-bearing-tx — but that total still covers the
+// outputs plus the fee of the CHANGE-LESS serialization. The whole leftover
+// (inputs − outputs) becomes the fee: at least the change-less minimum, and
+// less than the with-change fee the caller just failed against, so the
+// overpay is bounded by the fee cost of carrying a change output (~36 bytes'
+// worth — hundreds of VAR atoms, fractions of an SKA).
+//
+// Without this, amounts in the narrow band between "spendable − sweepFee"
+// and "spendable − changeFee" were unsendable with sender-pays-fee: the loop
+// demanded the with-change fee, the source had no more inputs, and the
+// authoring failed InsufficientBalance even though a perfectly valid and
+// relayable change-less tx existed. User-visible absurdity: reduce a
+// Max-filled amount by a few trailing digits (a handful of atoms — less
+// than the fee difference) and "insufficient funds" appears for a SMALLER
+// amount than the one that just worked.
+//
+// Returns nil when the shape doesn't apply — sweeps (no fixed outputs),
+// empty selections, SKA emission transactions (zero-fee, miner-authored),
+// an over-size serialization, or a leftover below the change-less fee —
+// and the caller then fails with InsufficientBalance exactly as before.
+// Never called in subtractfeefromamount mode (the fee comes out of the
+// recipient there, so this shape cannot arise).
+func changelessRescue(coinType cointype.CoinType, outputs []*wire.TxOut,
+	relayFeePerKb cointype.SKAAmount, inputDetail *InputDetail,
+	targetAmount dcrutil.Amount, targetSKAAmount cointype.SKAAmount,
+	maxTxSize int) *AuthoredTx {
+
+	if len(outputs) == 0 || len(inputDetail.Inputs) == 0 {
+		return nil
+	}
+	isSKA := coinType.IsSKA()
+	scriptSizes := append([]int(nil), inputDetail.RedeemScriptSizes...)
+	var changelessSize int
+	if isSKA {
+		changelessSize = txsizes.EstimateSerializeSizeSKA(scriptSizes, outputs, 0)
+	} else {
+		changelessSize = txsizes.EstimateSerializeSize(scriptSizes, outputs, 0)
+	}
+	if changelessSize > maxTxSize {
+		return nil
+	}
+	changelessFeeSKA := txrules.FeeForSerializeSizeSKA(relayFeePerKb, changelessSize)
+	if isSKA {
+		tempTx := &wire.MsgTx{
+			SerType: wire.TxSerializeFull,
+			Version: generatedTxVersion,
+			TxIn:    inputDetail.Inputs,
+			TxOut:   outputs,
+		}
+		if wire.IsSKAEmissionTransaction(tempTx) {
+			return nil
+		}
+		remaining := inputDetail.SKAAmount.Sub(targetSKAAmount)
+		if remaining.IsNegative() || remaining.Cmp(changelessFeeSKA) < 0 {
+			return nil
+		}
+	} else {
+		changelessFeeInt64, err := changelessFeeSKA.Int64()
+		if err != nil {
+			return nil
+		}
+		remaining := inputDetail.Amount - targetAmount
+		if remaining < dcrutil.Amount(changelessFeeInt64) {
+			return nil
+		}
+	}
+	return &AuthoredTx{
+		Tx: &wire.MsgTx{
+			SerType:  wire.TxSerializeFull,
+			Version:  generatedTxVersion,
+			TxIn:     inputDetail.Inputs,
+			TxOut:    outputs,
+			LockTime: 0,
+			Expiry:   0,
+		},
+		PrevScripts:                  inputDetail.Scripts,
+		TotalInput:                   inputDetail.Amount,
+		SKATotalInput:                inputDetail.SKAAmount,
+		ChangeIndex:                  -1,
+		EstimatedSignedSerializeSize: changelessSize,
 	}
 }
 
