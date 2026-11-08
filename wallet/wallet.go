@@ -5838,63 +5838,59 @@ func (s sigDataSource) GetScript(a stdaddr.Address) ([]byte, error) { return s.s
 
 // CreateVspPayment receives a tx and ensures that it pays the correct fee
 // amount to the correct address. It then signs that tx and adds it to the
-// wallet without broadcasting it to the network.
+// wallet without broadcasting it to the network. Inputs already in tx must be
+// locked by the caller, or topping them up may select them again.
 func (w *Wallet) CreateVspPayment(ctx context.Context, tx *wire.MsgTx, fee dcrutil.Amount,
 	feeAddr stdaddr.Address, feeAcct uint32, changeAcct uint32) error {
 
-	// Reserve new outputs to pay the fee if outputs have not already been
-	// reserved.  This will be the case for fee payments that were begun on
-	// already purchased tickets, where the caller did not ensure that fee
-	// outputs would already be reserved.
+	// The inputs must pay the VSP fee plus the miner fee of a fee tx with
+	// that many inputs.  Reserve more until they do: none may have been
+	// reserved yet, for fee payments begun on already purchased tickets, or
+	// the caller's may fall short.
 	relayFee := w.RelayFee()
-	minerPad := txrules.FeeForSerializeSize(relayFee, txsizes.EstimateSerializeSize(
-		[]int{txsizes.RedeemP2PKHSigScriptSize},
-		[]*wire.TxOut{{PkScript: make([]byte, txsizes.P2PKHPkScriptSize)}},
-		txsizes.P2PKHPkScriptSize))
-	need := fee + minerPad
-
-	var reserved []Input
-	if len(tx.TxIn) == 0 {
-		// 0-conf: a ticket buy just spent the confirmed UTXOs and the
-		// change is still unmined. Waiting for 1 conf left unpaid fees
-		// stuck until the next block.
-		const minconf = 0
-		// VSP fees are paid in VAR (staking is VAR-only)
-		inputs, err := w.ReserveOutputsForAmount(ctx, feeAcct, need, cointype.Zero(), minconf, cointype.CoinTypeVAR)
-		if err != nil {
-			return fmt.Errorf("unable to reserve outputs: %w", err)
+	need := func(inputs int) dcrutil.Amount {
+		sizes := make([]int, max(inputs, 1))
+		for i := range sizes {
+			sizes[i] = txsizes.RedeemP2PKHSigScriptSize
 		}
-		for _, in := range inputs {
-			tx.AddTxIn(wire.NewTxIn(&in.OutPoint, in.PrevOut.Value, nil))
-		}
-		reserved = inputs
+		return fee + txrules.FeeForSerializeSize(relayFee, txsizes.EstimateSerializeSize(sizes,
+			[]*wire.TxOut{{PkScript: make([]byte, txsizes.P2PKHPkScriptSize)}},
+			txsizes.P2PKHPkScriptSize))
 	}
+
+	// The transaction will be added to the wallet in an unpublished
+	// state, so there is no need to leave the outputs locked.
+	var reserved []Input
+	defer func() {
+		for _, in := range reserved {
+			w.UnlockOutpoint(&in.OutPoint.Hash, in.OutPoint.Index)
+		}
+	}()
 
 	var input int64
 	for _, in := range tx.TxIn {
 		input += in.ValueIn
 	}
-	if input < int64(need) {
+	for input < int64(need(len(tx.TxIn))) {
+		// 0-conf: a ticket buy just spent the confirmed UTXOs and the
+		// change is still unmined. Waiting for 1 conf left unpaid fees
+		// stuck until the next block.
 		const minconf = 0
-		extra, err := w.ReserveOutputsForAmount(ctx, feeAcct, need-dcrutil.Amount(input), cointype.Zero(), minconf, cointype.CoinTypeVAR)
+		// VSP fees are paid in VAR (staking is VAR-only)
+		extra, err := w.ReserveOutputsForAmount(ctx, feeAcct,
+			need(len(tx.TxIn))-dcrutil.Amount(input), cointype.Zero(), minconf, cointype.CoinTypeVAR)
 		if err != nil {
-			return fmt.Errorf("not enough input value to pay fee: %v < %v: %w",
-				dcrutil.Amount(input), fee, err)
+			return fmt.Errorf("unable to reserve outputs to pay fee: inputs %v < %v: %w",
+				dcrutil.Amount(input), need(len(tx.TxIn)), err)
+		}
+		if len(extra) == 0 { // or this loop never ends
+			return errors.E(errors.Bug, "no outputs reserved to pay fee")
 		}
 		for _, in := range extra {
 			tx.AddTxIn(wire.NewTxIn(&in.OutPoint, in.PrevOut.Value, nil))
 			input += in.PrevOut.Value
 		}
 		reserved = append(reserved, extra...)
-	}
-	// The transaction will be added to the wallet in an unpublished
-	// state, so there is no need to leave the outputs locked.
-	if len(reserved) > 0 {
-		defer func() {
-			for _, in := range reserved {
-				w.UnlockOutpoint(&in.OutPoint.Hash, in.OutPoint.Index)
-			}
-		}()
 	}
 
 	vers, feeScript := feeAddr.PaymentScript()
@@ -5923,13 +5919,18 @@ func (w *Wallet) CreateVspPayment(ctx context.Context, tx *wire.MsgTx, fee dcrut
 		PkScript: feeScript,
 		CoinType: cointype.CoinTypeVAR, // VSP fees are always VAR; set explicitly
 	})
-	feeRate := w.RelayFee()
+	feeRate := relayFee
 	scriptSizes := make([]int, len(tx.TxIn))
 	for i := range scriptSizes {
 		scriptSizes[i] = txsizes.RedeemP2PKHSigScriptSize
 	}
 	est := txsizes.EstimateSerializeSize(scriptSizes, tx.TxOut, txsizes.P2PKHPkScriptSize)
-	change := input
+	// Sum the inputs the tx holds now, so the change pays back every one of
+	// them.
+	var change int64
+	for _, in := range tx.TxIn {
+		change += in.ValueIn
+	}
 	change -= tx.TxOut[0].Value
 	change -= int64(txrules.FeeForSerializeSize(feeRate, est))
 	if !txrules.IsDustAmount(dcrutil.Amount(change), txsizes.P2PKHPkScriptSize, feeRate) {
