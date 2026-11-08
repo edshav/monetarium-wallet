@@ -1700,15 +1700,29 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 	// at all (e.g. operator pointed at an SKA-only account), surface an
 	// actionable error here rather than failing late inside mixedSplit /
 	// individualSplit as a generic InsufficientBalance.
-	varBalance, err := w.AccountBalanceByCoinType(ctx, req.SourceAccount, cointype.CoinTypeVAR, req.MinConf)
-	if err != nil {
-		return nil, errors.E(op, err)
+	var spendable dcrutil.Amount
+	if req.MinConf == 0 {
+		// AccountBalanceByCoinType never counts unmined credits as
+		// Spendable. Selection at minconf 0 spends published non-stake
+		// ones, as the VSP fee-split retry in PurchaseTickets needs, and
+		// AccountBalance counts those as Spendable.
+		bal, err := w.AccountBalance(ctx, req.SourceAccount, 0)
+		if err != nil {
+			return nil, errors.E(op, err)
+		}
+		spendable = bal.Spendable
+	} else {
+		varBalance, err := w.AccountBalanceByCoinType(ctx, req.SourceAccount, cointype.CoinTypeVAR, req.MinConf)
+		if err != nil {
+			return nil, errors.E(op, err)
+		}
+		spendable = varBalance.Spendable
 	}
 	// Check Spendable (not Total): a wallet with all VAR locked in tickets
 	// has Total > 0 but Spendable = 0; the ticket purchase still cannot
 	// fund a new split, and the late mixedSplit/individualSplit failure
 	// reports the same condition with less actionable wording.
-	if varBalance.Spendable == 0 {
+	if spendable == 0 {
 		return nil, errors.E(op, errors.InsufficientBalance,
 			errors.Errorf("source account %d has no spendable VAR; staking requires spendable VAR (cointype %d)",
 				req.SourceAccount, cointype.CoinTypeVAR))
