@@ -5846,33 +5846,55 @@ func (w *Wallet) CreateVspPayment(ctx context.Context, tx *wire.MsgTx, fee dcrut
 	// reserved.  This will be the case for fee payments that were begun on
 	// already purchased tickets, where the caller did not ensure that fee
 	// outputs would already be reserved.
+	relayFee := w.RelayFee()
+	minerPad := txrules.FeeForSerializeSize(relayFee, txsizes.EstimateSerializeSize(
+		[]int{txsizes.RedeemP2PKHSigScriptSize},
+		[]*wire.TxOut{{PkScript: make([]byte, txsizes.P2PKHPkScriptSize)}},
+		txsizes.P2PKHPkScriptSize))
+	need := fee + minerPad
+
+	var reserved []Input
 	if len(tx.TxIn) == 0 {
-		const minconf = 1
+		// 0-conf: a ticket buy just spent the confirmed UTXOs and the
+		// change is still unmined. Waiting for 1 conf left unpaid fees
+		// stuck until the next block.
+		const minconf = 0
 		// VSP fees are paid in VAR (staking is VAR-only)
-		inputs, err := w.ReserveOutputsForAmount(ctx, feeAcct, fee, cointype.Zero(), minconf, cointype.CoinTypeVAR)
+		inputs, err := w.ReserveOutputsForAmount(ctx, feeAcct, need, cointype.Zero(), minconf, cointype.CoinTypeVAR)
 		if err != nil {
 			return fmt.Errorf("unable to reserve outputs: %w", err)
 		}
 		for _, in := range inputs {
 			tx.AddTxIn(wire.NewTxIn(&in.OutPoint, in.PrevOut.Value, nil))
 		}
-		// The transaction will be added to the wallet in an unpublished
-		// state, so there is no need to leave the outputs locked.
-		defer func() {
-			for _, in := range inputs {
-				w.UnlockOutpoint(&in.OutPoint.Hash, in.OutPoint.Index)
-			}
-		}()
+		reserved = inputs
 	}
 
 	var input int64
 	for _, in := range tx.TxIn {
 		input += in.ValueIn
 	}
-	if input < int64(fee) {
-		err := fmt.Errorf("not enough input value to pay fee: %v < %v",
-			dcrutil.Amount(input), fee)
-		return err
+	if input < int64(need) {
+		const minconf = 0
+		extra, err := w.ReserveOutputsForAmount(ctx, feeAcct, need-dcrutil.Amount(input), cointype.Zero(), minconf, cointype.CoinTypeVAR)
+		if err != nil {
+			return fmt.Errorf("not enough input value to pay fee: %v < %v: %w",
+				dcrutil.Amount(input), fee, err)
+		}
+		for _, in := range extra {
+			tx.AddTxIn(wire.NewTxIn(&in.OutPoint, in.PrevOut.Value, nil))
+			input += in.PrevOut.Value
+		}
+		reserved = append(reserved, extra...)
+	}
+	// The transaction will be added to the wallet in an unpublished
+	// state, so there is no need to leave the outputs locked.
+	if len(reserved) > 0 {
+		defer func() {
+			for _, in := range reserved {
+				w.UnlockOutpoint(&in.OutPoint.Hash, in.OutPoint.Index)
+			}
+		}()
 	}
 
 	vers, feeScript := feeAddr.PaymentScript()
