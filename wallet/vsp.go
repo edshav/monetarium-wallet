@@ -206,10 +206,10 @@ func (c *VSPClient) ProcessManagedTickets(ctx context.Context, tickets []*VSPTic
 // feeTx may be nil or may point to an empty transaction. It is modified with
 // the inputs and the fee and change outputs before returning without an error.
 // The fee transaction is also recorded as unpublised in the wallet, and the fee
-// hash is associated with the ticket.  On error the caller should unlock the
-// inputs of feeTx.  The fee payment keeps feeTx only if a scheduled attempt
-// made its own fee tx in it meanwhile, which the wallet records as spending
-// those inputs.
+// hash is associated with the ticket.  If getting the fee address or making the
+// fee tx fails, the caller should unlock the inputs of feeTx, and the fee
+// payment does not keep it.  If only submitting it fails, the wallet keeps the
+// fee tx and the fee payment retries it.
 func (c *VSPClient) Process(ctx context.Context, ticket *VSPTicket, feeTx *wire.MsgTx) error {
 	vspTicket, err := ticket.VSPTicketInfo(ctx)
 	if err != nil && !errors.Is(err, errors.NotExist) {
@@ -232,11 +232,17 @@ func (c *VSPClient) Process(ctx context.Context, ticket *VSPTicket, feeTx *wire.
 			}
 			return fmt.Errorf("fee payment cannot be processed")
 		}
+		// Read the hash before waiting for a scheduled attempt on this
+		// ticket to finish: a fee tx it makes meanwhile is the attempt's.
+		fp.mu.Lock()
+		startHash := fp.feeHash
+		fp.mu.Unlock()
+		fp.procMu.Lock()
+		defer fp.procMu.Unlock()
 		fp.mu.Lock()
 		if fp.feeTx == nil {
 			fp.feeTx = feeTx
 		}
-		startHash := fp.feeHash
 		fp.mu.Unlock()
 		feeErr := fp.receiveFeeAddress()
 		if feeErr == nil {
@@ -245,13 +251,13 @@ func (c *VSPClient) Process(ctx context.Context, ticket *VSPTicket, feeTx *wire.
 		if feeErr != nil {
 			// On failure the caller unlocks the inputs of feeTx, and a
 			// later purchase may spend them; after a failed makeFeeTx it
-			// may also have outputs but no signatures.  The scheduled
-			// attempt must not build on it, unless it made its own fee tx
-			// meanwhile (new hash); that attempt also owns the recorded
-			// status, which marking it errored would erase.
+			// may also have outputs but no signatures, so the job must
+			// not keep it.  A scheduled attempt that changed the fee hash
+			// while Process waited owns the recorded status, which
+			// marking it errored would erase.
 			fp.mu.Lock()
 			madeMeanwhile := fp.feeHash != startHash
-			if fp.feeTx == feeTx && !madeMeanwhile {
+			if fp.feeTx == feeTx {
 				fp.feeTx = nil
 			}
 			fp.mu.Unlock()
@@ -277,6 +283,8 @@ func (c *VSPClient) Process(ctx context.Context, ticket *VSPTicket, feeTx *wire.
 			return fmt.Errorf("fee payment cannot be processed")
 		}
 
+		fp.procMu.Lock()
+		defer fp.procMu.Unlock()
 		return fp.confirmPayment()
 	case udb.VSPFeeProcessConfirmed:
 		// VSPTicket has already been confirmed, there is nothing to process.
