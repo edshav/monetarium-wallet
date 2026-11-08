@@ -444,7 +444,6 @@ func (s *Syncer) PublishTransactions(ctx context.Context, txs ...*wire.MsgTx) er
 		walletBacked[tx.TxHash()] = true
 	}
 
-	msg := wire.NewMsgInvSizeHint(uint(len(txs)))
 	for _, tx := range txs {
 		txHash := tx.TxHash()
 		if !walletBacked[txHash] {
@@ -458,17 +457,63 @@ func (s *Syncer) PublishTransactions(ctx context.Context, txs ...*wire.MsgTx) er
 				}
 			}
 		}
-		err := msg.AddInvVect(wire.NewInvVect(wire.InvTypeTx, &txHash))
-		if err != nil {
-			return errors.E(errors.Protocol, err)
+	}
+
+	// Send to all peers at once, from a copy of the peer list, so that a
+	// peer whose send stalls neither holds remotesMu nor delays the others.
+	// The call fails only when no peer took the transactions: after one
+	// has, the caller must not abandon a transaction the network may mine.
+	s.remotesMu.Lock()
+	remotes := make([]*p2p.RemotePeer, 0, len(s.remotes))
+	for _, rp := range s.remotes {
+		remotes = append(remotes, rp)
+	}
+	s.remotesMu.Unlock()
+	const op errors.Op = "spv.PublishTransactions"
+	if len(remotes) == 0 {
+		return errors.E(op, errors.NoPeers)
+	}
+	var (
+		wg        sync.WaitGroup
+		mu        sync.Mutex
+		delivered bool
+		lastErr   error
+	)
+	for _, rp := range remotes {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := pushTransactions(ctx, rp, txs)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				log.Warnf("Failed to send transactions to peer %v: %v", rp, err)
+				lastErr = err
+				return
+			}
+			delivered = true
+		}()
+	}
+	wg.Wait()
+	if !delivered {
+		return errors.E(op, lastErr)
+	}
+	return nil
+}
+
+// pushTransactions sends txs to rp as tx messages rather than an inv.  A peer
+// that ignores an inv never asks for the transaction and reports nothing, and
+// sending both would have it fetch the transaction a second time.  The hashes
+// still go into InvsSent, so a getdata for them is served should a peer send
+// one.
+func pushTransactions(ctx context.Context, rp *p2p.RemotePeer, txs []*wire.MsgTx) error {
+	for _, tx := range txs {
+		rp.InvsSent().Add(tx.TxHash())
+		if err := rp.SendMessage(ctx, tx); err != nil {
+			return err
 		}
 	}
-	return s.forRemotes(func(rp *p2p.RemotePeer) error {
-		for _, inv := range msg.InvList {
-			rp.InvsSent().Add(inv.Hash)
-		}
-		return rp.SendMessage(ctx, msg)
-	})
+	return nil
 }
 
 // PublishMixMessages implements the PublishMixMessages method of the
