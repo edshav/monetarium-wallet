@@ -1599,7 +1599,7 @@ func (w *Wallet) mixedSplit(ctx context.Context, req *PurchaseTicketsRequest, ne
 	return splitTx, cj.MixedIndices(), nil
 }
 
-func (w *Wallet) individualSplit(ctx context.Context, req *PurchaseTicketsRequest, neededPerTicket dcrutil.Amount) (tx *wire.MsgTx, outIndexes []int, err error) {
+func (w *Wallet) individualSplit(ctx context.Context, req *PurchaseTicketsRequest, neededPerTicket, feePerTicket dcrutil.Amount) (tx *wire.MsgTx, outIndexes, feeIndexes []int, err error) {
 	// Fetch the single use split address to break tickets into, to
 	// immediately be consumed as tickets.
 	//
@@ -1627,6 +1627,21 @@ func (w *Wallet) individualSplit(ctx context.Context, req *PurchaseTicketsReques
 			CoinType: ticketCoinType,
 		})
 		outIndexes = append(outIndexes, i)
+	}
+	// Fund each VSP fee from this same split instead of a second
+	// "fee-prep" transaction. One large UTXO then becomes
+	// N ticket outputs + N fee outputs + change, which is what
+	// purchaseTickets used to do with two txs when Count==1.
+	if feePerTicket > 0 {
+		for i := 0; i < req.Count; i++ {
+			splitOuts = append(splitOuts, &wire.TxOut{
+				Value:    int64(feePerTicket),
+				PkScript: splitPkScript,
+				Version:  vers,
+				CoinType: ticketCoinType,
+			})
+			feeIndexes = append(feeIndexes, len(splitOuts)-1)
+		}
 	}
 
 	const op errors.Op = "individualSplit"
@@ -1795,6 +1810,11 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 
 	var vspFeeCredits, ticketCredits [][]Input
 	unlockCredits := true
+	// feePerTicket > 0 means individualSplit will emit one fee-sized
+	// output per ticket. That replaces the extra "fee-prep" split
+	// PurchaseTickets used to publish when a single UTXO had to fund
+	// both the ticket and the VSP fee (typical auto-buy after change).
+	var feePerTicket dcrutil.Amount
 	total := func(ins []Input) (v int64) {
 		for _, in := range ins {
 			v += in.PrevOut.Value
@@ -1827,6 +1847,15 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 		fee := txrules.StakePoolTicketFee(ticketPrice, ticketFee,
 			tipHeight, feePrice, w.chainParams,
 			dcp0010Active, dcp0012Active)
+		// StakePoolTicketFee is the VSP quote only. CreateVspPayment also
+		// pays a miner fee from the same inputs — reserve that too or a
+		// UTXO that exactly matches the quote produces a 0-relay-fee tx.
+		relayFee := w.RelayFee()
+		feeEst := txsizes.EstimateSerializeSize(
+			[]int{txsizes.RedeemP2PKHSigScriptSize},
+			[]*wire.TxOut{{PkScript: make([]byte, txsizes.P2PKHPkScriptSize)}},
+			txsizes.P2PKHPkScriptSize)
+		fee += txrules.FeeForSerializeSize(relayFee, feeEst)
 
 		// Reserve outputs for number of buys.
 		vspFeeCredits = make([][]Input, 0, req.Count)
@@ -1847,126 +1876,138 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 			vspFeeCredits[0] = []Input{*req.extraSplitOutput}
 			op := &req.extraSplitOutput.OutPoint
 			w.LockOutpoint(&op.Hash, op.Index)
-		}
-		var lowBalance bool
-		for i := 0; i < req.Count; i++ {
-			if req.extraSplitOutput == nil {
-				credits, err := w.ReserveOutputsForAmount(ctx,
-					req.SourceAccount, fee, cointype.Zero(), req.MinConf, cointype.CoinTypeVAR)
+		} else if !req.Mixing {
+			// Fund the VSP fee from the ticket split itself. Reserving a
+			// separate existing UTXO for a ~fee-sized payment used to lock
+			// the only large UTXO, then force a second split just to unlock
+			// it again (errVSPFeeRequiresUTXOSplit). Mixed buys keep the
+			// old reservation path — mixed accounts have many small UTXOs.
+			// One extra miner-pad so CreateVspPayment is not exact-fit
+			// (a slightly larger fee tx then had to grab another UTXO).
+			feePerTicket = fee + txrules.FeeForSerializeSize(relayFee, feeEst)
+			log.Infof("VSP fee %v per ticket will be funded from the ticket split", feePerTicket)
+		} else {
+			var lowBalance bool
+			for i := 0; i < req.Count; i++ {
+				if req.extraSplitOutput == nil {
+					credits, err := w.ReserveOutputsForAmount(ctx,
+						req.SourceAccount, fee, cointype.Zero(), req.MinConf, cointype.CoinTypeVAR)
 
+					if errors.Is(err, errors.InsufficientBalance) {
+						lowBalance = true
+						break
+					}
+					if err != nil {
+						log.Errorf("ReserveOutputsForAmount failed: %v", err)
+						return nil, err
+					}
+					vspFeeCredits = append(vspFeeCredits, credits)
+				}
+
+				credits, err := w.ReserveOutputsForAmount(ctx, req.SourceAccount,
+					ticketPrice, cointype.Zero(), req.MinConf, cointype.CoinTypeVAR)
 				if errors.Is(err, errors.InsufficientBalance) {
 					lowBalance = true
+					credits, _ = w.reserveOutputs(ctx, req.SourceAccount,
+						req.MinConf, cointype.CoinTypeVAR)
+					if len(credits) != 0 {
+						ticketCredits = append(ticketCredits, credits)
+					}
 					break
 				}
 				if err != nil {
 					log.Errorf("ReserveOutputsForAmount failed: %v", err)
 					return nil, err
 				}
-				vspFeeCredits = append(vspFeeCredits, credits)
+				ticketCredits = append(ticketCredits, credits)
 			}
-
-			credits, err := w.ReserveOutputsForAmount(ctx, req.SourceAccount,
-				ticketPrice, cointype.Zero(), req.MinConf, cointype.CoinTypeVAR)
-			if errors.Is(err, errors.InsufficientBalance) {
-				lowBalance = true
-				credits, _ = w.reserveOutputs(ctx, req.SourceAccount,
-					req.MinConf, cointype.CoinTypeVAR)
-				if len(credits) != 0 {
-					ticketCredits = append(ticketCredits, credits)
-				}
-				break
-			}
-			if err != nil {
-				log.Errorf("ReserveOutputsForAmount failed: %v", err)
-				return nil, err
-			}
-			ticketCredits = append(ticketCredits, credits)
-		}
-		for _, credits := range ticketCredits {
-			for _, c := range credits {
-				log.Debugf("unlocked credit for ticket tx: %v",
-					c.OutPoint.String())
-				w.UnlockOutpoint(&c.OutPoint.Hash, c.OutPoint.Index)
-			}
-		}
-		if lowBalance {
-			// When there is UTXO contention between reserved fee
-			// UTXOs and the tickets that can be purchased, UTXOs
-			// which were selected for paying VSP fees are instead
-			// allocated towards purchasing tickets.  We sort the
-			// UTXOs picked for fees and tickets by decreasing
-			// amounts and incrementally reserve them for ticket
-			// purchases while reducing the total number of fees
-			// (and therefore tickets) that will be purchased.  The
-			// final UTXOs chosen for ticket purchases must be
-			// unlocked for UTXO selection to work, while all inputs
-			// for fee payments must be locked.
-			credits := vspFeeCredits[:len(vspFeeCredits):len(vspFeeCredits)]
-			credits = append(credits, ticketCredits...)
-			sort.Slice(credits, func(i, j int) bool {
-				return total(credits[i]) > total(credits[j])
-			})
-			if len(credits) == 0 {
-				return nil, errors.E(errors.InsufficientBalance)
-			}
-			if req.Count > len(credits)-1 {
-				req.Count = len(credits) - 1
-			}
-			var freedBalance int64
-			extraSplit := true
-			for req.Count > 1 {
-				for _, c := range credits[0] {
-					freedBalance += c.PrevOut.Value
+			for _, credits := range ticketCredits {
+				for _, c := range credits {
+					log.Debugf("unlocked credit for ticket tx: %v",
+						c.OutPoint.String())
 					w.UnlockOutpoint(&c.OutPoint.Hash, c.OutPoint.Index)
 				}
-				credits = credits[1:]
-				// XXX this is a bad estimate because it doesn't
-				// consider the transaction fees
-				if freedBalance > int64(ticketPrice)*int64(req.Count) {
-					extraSplit = false
-					break
-				}
-				req.Count--
 			}
-			vspFeeCredits = credits
-			var remaining int64
-			for _, c := range vspFeeCredits {
-				remaining += total(c)
-				for i := range c {
-					w.LockOutpoint(&c[i].OutPoint.Hash, c[i].OutPoint.Index)
-				}
-			}
-
-			if req.Count < 2 && extraSplit {
-				// XXX still a bad estimate
-				if int64(ticketPrice) > freedBalance+remaining {
+			if lowBalance {
+				// When there is UTXO contention between reserved fee
+				// UTXOs and the tickets that can be purchased, UTXOs
+				// which were selected for paying VSP fees are instead
+				// allocated towards purchasing tickets.  We sort the
+				// UTXOs picked for fees and tickets by decreasing
+				// amounts and incrementally reserve them for ticket
+				// purchases while reducing the total number of fees
+				// (and therefore tickets) that will be purchased.  The
+				// final UTXOs chosen for ticket purchases must be
+				// unlocked for UTXO selection to work, while all inputs
+				// for fee payments must be locked.
+				credits := vspFeeCredits[:len(vspFeeCredits):len(vspFeeCredits)]
+				credits = append(credits, ticketCredits...)
+				sort.Slice(credits, func(i, j int) bool {
+					return total(credits[i]) > total(credits[j])
+				})
+				if len(credits) == 0 {
 					return nil, errors.E(errors.InsufficientBalance)
 				}
-				// A new transaction may need to be created to
-				// split a single UTXO into two: one to pay the
-				// VSP fee, and a second to fund the ticket
-				// purchase.  This error condition is left to
-				// the caller to detect and perform.
-				return nil, errVSPFeeRequiresUTXOSplit
+				if req.Count > len(credits)-1 {
+					req.Count = len(credits) - 1
+				}
+				var freedBalance int64
+				extraSplit := true
+				for req.Count > 1 {
+					for _, c := range credits[0] {
+						freedBalance += c.PrevOut.Value
+						w.UnlockOutpoint(&c.OutPoint.Hash, c.OutPoint.Index)
+					}
+					credits = credits[1:]
+					// XXX this is a bad estimate because it doesn't
+					// consider the transaction fees
+					if freedBalance > int64(ticketPrice)*int64(req.Count) {
+						extraSplit = false
+						break
+					}
+					req.Count--
+				}
+				vspFeeCredits = credits
+				var remaining int64
+				for _, c := range vspFeeCredits {
+					remaining += total(c)
+					for i := range c {
+						w.LockOutpoint(&c[i].OutPoint.Hash, c[i].OutPoint.Index)
+					}
+				}
+
+				if req.Count < 2 && extraSplit {
+					// XXX still a bad estimate
+					if int64(ticketPrice) > freedBalance+remaining {
+						return nil, errors.E(errors.InsufficientBalance)
+					}
+					// A new transaction may need to be created to
+					// split a single UTXO into two: one to pay the
+					// VSP fee, and a second to fund the ticket
+					// purchase.  This error condition is left to
+					// the caller to detect and perform.
+					return nil, errVSPFeeRequiresUTXOSplit
+				}
 			}
-		}
-		log.Infof("Reserved credits for %d tickets: total fee: %v", req.Count, fee)
-		for _, credit := range vspFeeCredits {
-			for _, c := range credit {
-				log.Debugf("%s reserved for vsp fee transaction", c.OutPoint.String())
+			log.Infof("Reserved credits for %d tickets: total fee: %v", req.Count, fee)
+			for _, credit := range vspFeeCredits {
+				for _, c := range credit {
+					log.Debugf("%s reserved for vsp fee transaction", c.OutPoint.String())
+				}
 			}
 		}
 	}
 
 	purchaseTicketsResponse := &PurchaseTicketsResponse{}
 	var splitTx *wire.MsgTx
-	var splitOutputIndexes []int
+	var splitOutputIndexes, splitFeeIndexes []int
 	for {
 		switch {
 		case req.Mixing:
 			splitTx, splitOutputIndexes, err = w.mixedSplit(ctx, req, neededPerTicket)
+			splitFeeIndexes = nil
 		default:
-			splitTx, splitOutputIndexes, err = w.individualSplit(ctx, req, neededPerTicket)
+			splitTx, splitOutputIndexes, splitFeeIndexes, err = w.individualSplit(ctx, req, neededPerTicket, feePerTicket)
 		}
 		if errors.Is(err, errors.InsufficientBalance) && req.Count > 1 {
 			req.Count--
@@ -2017,6 +2058,25 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 				log.Errorf("Cannot abandon %v: %v", &hash, abandonErr)
 			}
 			return nil, err
+		}
+	}
+
+	// Lock the fee-sized split outputs so CreateVspPayment spends them
+	// (and not a random leftover UTXO) when paying the VSP.
+	if len(splitFeeIndexes) > 0 && req.extraSplitOutput == nil {
+		splitHash := splitTx.TxHash()
+		vspFeeCredits = make([][]Input, 0, len(splitFeeIndexes))
+		for _, idx := range splitFeeIndexes {
+			if idx < 0 || idx >= len(splitTx.TxOut) {
+				continue
+			}
+			op := wire.OutPoint{Hash: splitHash, Index: uint32(idx)}
+			w.LockOutpoint(&op.Hash, op.Index)
+			vspFeeCredits = append(vspFeeCredits, []Input{{
+				OutPoint: op,
+				PrevOut:  *splitTx.TxOut[idx],
+			}})
+			log.Infof("Split output %v reserved for VSP fee", &op)
 		}
 	}
 
@@ -2181,14 +2241,19 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 		}
 		unlockCredits = false
 		feeTx := wire.NewMsgTx()
-		for j := range vspFeeCredits[i] {
-			in := &vspFeeCredits[i][j]
-			feeTx.AddTxIn(wire.NewTxIn(&in.OutPoint, in.PrevOut.Value, nil))
+		if i < len(vspFeeCredits) {
+			for j := range vspFeeCredits[i] {
+				in := &vspFeeCredits[i][j]
+				feeTx.AddTxIn(wire.NewTxIn(&in.OutPoint, in.PrevOut.Value, nil))
+			}
 		}
 		ticketHash := purchaseTicketsResponse.TicketHashes[i]
 
 		// Unlock outpoints in case of error.
 		unlock := func() {
+			if i >= len(vspFeeCredits) {
+				return
+			}
 			for _, outpoint := range vspFeeCredits[i] {
 				w.UnlockOutpoint(&outpoint.OutPoint.Hash,
 					outpoint.OutPoint.Index)
