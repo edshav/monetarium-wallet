@@ -132,13 +132,17 @@ func (s *Store) InsertMemPoolTx(dbtx walletdb.ReadWriteTx, rec *TxRecord) error 
 	return nil
 }
 
-// SetPublished modifies the published state of an unmined transaction.
-func (s *Store) SetPublished(dbtx walletdb.ReadWriteTx, txHash *chainhash.Hash, published bool) error {
+// SetPublished modifies the published state of an unmined transaction, and
+// reports whether the state changed.
+func (s *Store) SetPublished(dbtx walletdb.ReadWriteTx, txHash *chainhash.Hash, published bool) (bool, error) {
 	ns := dbtx.ReadWriteBucket(wtxmgrBucketKey)
-	if published {
-		return deleteUnpublished(ns, txHash[:])
+	if existsUnpublished(ns, txHash[:]) != published {
+		return false, nil
 	}
-	return putUnpublished(ns, txHash[:])
+	if published {
+		return true, deleteUnpublished(ns, txHash[:])
+	}
+	return true, putUnpublished(ns, txHash[:])
 }
 
 // removeDoubleSpends checks for any unmined transactions which would introduce

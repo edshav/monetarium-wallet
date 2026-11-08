@@ -1186,6 +1186,14 @@ func (s *Syncer) handleTxInvs(ctx context.Context, rp *p2p.RemotePeer, hashes []
 				rp.Disconnect(err)
 				return
 			}
+			continue
+		}
+
+		// A peer relayed the transaction, so it is in a mempool, and one
+		// the wallet held back as unpublished has been broadcast.
+		hash := tx.TxHash()
+		if err := s.wallet.SetPublished(ctx, &hash, true); err != nil {
+			log.Warnf("Cannot mark relayed transaction %v published: %v", &hash, err)
 		}
 	}
 	s.mempoolTxs(relevant)
