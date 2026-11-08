@@ -1660,6 +1660,23 @@ func (w *Wallet) individualSplit(ctx context.Context, req *PurchaseTicketsReques
 	if err != nil {
 		return
 	}
+	if len(feeIndexes) > 0 {
+		// Lock the fee outputs before recording the split makes them
+		// spendable credits, so no concurrent spend can select them.  The
+		// lock is in memory only: after a restart they are ordinary
+		// outputs that any spend may select.
+		hash := a.atx.Tx.TxHash()
+		for _, idx := range feeIndexes {
+			w.LockOutpoint(&hash, uint32(idx))
+		}
+		defer func() {
+			if err != nil {
+				for _, idx := range feeIndexes {
+					w.UnlockOutpoint(&hash, uint32(idx))
+				}
+			}
+		}()
+	}
 	if !req.DontSignTx {
 		err = w.recordAuthoredTx(ctx, op, a)
 		if err != nil {
@@ -1848,8 +1865,8 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 			tipHeight, feePrice, w.chainParams,
 			dcp0010Active, dcp0012Active)
 		// StakePoolTicketFee is the VSP quote only. CreateVspPayment also
-		// pays a miner fee from the same inputs — reserve that too or a
-		// UTXO that exactly matches the quote produces a 0-relay-fee tx.
+		// pays a miner fee from the same inputs, so reserve one: a UTXO
+		// worth only the quote leaves nothing for the miner.
 		relayFee := w.RelayFee()
 		feeEst := txsizes.EstimateSerializeSize(
 			[]int{txsizes.RedeemP2PKHSigScriptSize},
@@ -1876,16 +1893,25 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 			vspFeeCredits[0] = []Input{*req.extraSplitOutput}
 			op := &req.extraSplitOutput.OutPoint
 			w.LockOutpoint(&op.Hash, op.Index)
-		} else if !req.Mixing {
+		}
+		if req.extraSplitOutput == nil && !req.Mixing {
 			// Fund the VSP fee from the ticket split itself. Reserving a
 			// separate existing UTXO for a ~fee-sized payment used to lock
 			// the only large UTXO, then force a second split just to unlock
-			// it again (errVSPFeeRequiresUTXOSplit). Mixed buys keep the
-			// old reservation path — mixed accounts have many small UTXOs.
-			// One extra miner-pad so CreateVspPayment is not exact-fit
-			// (a slightly larger fee tx then had to grab another UTXO).
-			feePerTicket = fee + txrules.FeeForSerializeSize(relayFee, feeEst)
-			log.Infof("VSP fee %v per ticket will be funded from the ticket split", feePerTicket)
+			// it again (errVSPFeeRequiresUTXOSplit). Mixed buys and the
+			// extraSplitOutput retry keep the reservation loop below.
+			// An unsigned purchase pays no fee, so its split gets none.
+			//
+			// The second miner-fee pad covers a VSP quote above the
+			// wallet's estimate (monetarium-vsp prices with the tip's SBits
+			// and a fixed 1e4 relay fee); a one-input fee tx already matches
+			// the first pad.  An unused pad is below the dust limit at the
+			// relay fee it was sized with, so CreateVspPayment gives it to
+			// the miner rather than returning it as change.
+			if !req.DontSignTx {
+				feePerTicket = fee + txrules.FeeForSerializeSize(relayFee, feeEst)
+				log.Infof("VSP fee %v per ticket will be funded from the ticket split", feePerTicket)
+			}
 		} else {
 			var lowBalance bool
 			for i := 0; i < req.Count; i++ {
@@ -2026,6 +2052,22 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 	}
 	purchaseTicketsResponse.SplitTx = splitTx
 
+	// individualSplit locked the fee-sized split outputs; CreateVspPayment
+	// takes them as the fee tx inputs, and the deferred unlockCredits
+	// releases them if the purchase fails first.
+	if len(splitFeeIndexes) > 0 {
+		splitHash := splitTx.TxHash()
+		vspFeeCredits = make([][]Input, 0, len(splitFeeIndexes))
+		for _, idx := range splitFeeIndexes {
+			op := wire.OutPoint{Hash: splitHash, Index: uint32(idx)}
+			vspFeeCredits = append(vspFeeCredits, []Input{{
+				OutPoint: op,
+				PrevOut:  *splitTx.TxOut[idx],
+			}})
+			log.Infof("Split output %v reserved for VSP fee", &op)
+		}
+	}
+
 	// Process and publish split tx.
 	if !req.DontSignTx {
 		rec, err := udb.NewTxRecordFromMsgTx(splitTx, time.Now())
@@ -2058,25 +2100,6 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 				log.Errorf("Cannot abandon %v: %v", &hash, abandonErr)
 			}
 			return nil, err
-		}
-	}
-
-	// Lock the fee-sized split outputs so CreateVspPayment spends them
-	// (and not a random leftover UTXO) when paying the VSP.
-	if len(splitFeeIndexes) > 0 && req.extraSplitOutput == nil {
-		splitHash := splitTx.TxHash()
-		vspFeeCredits = make([][]Input, 0, len(splitFeeIndexes))
-		for _, idx := range splitFeeIndexes {
-			if idx < 0 || idx >= len(splitTx.TxOut) {
-				continue
-			}
-			op := wire.OutPoint{Hash: splitHash, Index: uint32(idx)}
-			w.LockOutpoint(&op.Hash, op.Index)
-			vspFeeCredits = append(vspFeeCredits, []Input{{
-				OutPoint: op,
-				PrevOut:  *splitTx.TxOut[idx],
-			}})
-			log.Infof("Split output %v reserved for VSP fee", &op)
 		}
 	}
 
