@@ -3028,7 +3028,9 @@ func (s *Store) UnspentOutput(ns walletdb.ReadBucket, op wire.OutPoint, includeM
 	return nil, errors.E(errors.NotExist, errors.Errorf("no unspent output %v", op))
 }
 
-// ForEachUnspentOutpoint calls f on each UTXO outpoint.
+// ForEachUnspentOutpoint calls f on each UTXO outpoint, including outputs that
+// unmined transactions spend: a spender with no output of the wallet is
+// otherwise not seen when it is mined.
 // If coinType is nil, iterates through all unspent outputs across all coin types.
 // If coinType is specified, iterates only through outputs of that specific coin type.
 // The order is undefined.
@@ -3064,11 +3066,6 @@ func (s *Store) ForEachUnspentOutpoint(dbtx walletdb.ReadTx, coinType *cointype.
 			if err != nil {
 				c.Close()
 				return err
-			}
-			if existsRawUnminedInput(ns, k) != nil {
-				// Output is spent by an unmined transaction.
-				// Skip this k/v pair.
-				continue
 			}
 
 			block := new(Block)
@@ -3117,12 +3114,6 @@ func (s *Store) ForEachUnspentOutpoint(dbtx walletdb.ReadTx, coinType *cointype.
 
 		c := bucket.ReadCursor()
 		for k, v := c.First(); k != nil; k, v = c.Next() {
-			if existsRawUnminedInput(ns, k) != nil {
-				// Output is spent by an unmined transaction.
-				// Skip to next unmined credit.
-				continue
-			}
-
 			// Skip outputs from unpublished transactions.
 			txHash := k[:32]
 			if existsUnpublished(ns, txHash) {
