@@ -2141,6 +2141,7 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 		return purchaseTicketsResponse, nil
 	}
 
+	var feeErrs []error
 	for i, ticket := range tickets {
 		// Check for request context cancellation while waiting for
 		// trickle time if this was a mixed buy.
@@ -2198,22 +2199,31 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 		ticket, err := w.NewVSPTicket(ctx, ticketHash)
 		if err != nil {
 			unlock()
+			log.Errorf("VSP ticket record for published %v failed: %v", ticketHash, err)
+			feeErrs = append(feeErrs, err)
 			continue
 		}
 
 		err = req.VSPClient.Process(ctx, ticket, feeTx)
 		if err != nil {
 			unlock()
+			// Ticket is already on-chain. Keep publishing the rest;
+			// fees can be retried via ProcessUnpaidVSPTickets.
+			log.Errorf("VSP fee for published ticket %v failed: %v", ticketHash, err)
+			feeErrs = append(feeErrs, err)
 			continue
 		}
-		// watch for outpoints change.
-		_, err = udb.NewTxRecordFromMsgTx(feeTx, time.Now())
-		if err != nil {
-			return nil, err
+		// Record is only used as a sanity check; the fee tx is already
+		// in the wallet via CreateVspPayment. Never drop published hashes.
+		if _, recErr := udb.NewTxRecordFromMsgTx(feeTx, time.Now()); recErr != nil {
+			log.Errorf("fee tx record for %v: %v", ticketHash, recErr)
 		}
 	}
 
-	return purchaseTicketsResponse, err
+	if len(feeErrs) > 0 {
+		return purchaseTicketsResponse, errors.E(op, errors.Join(feeErrs...))
+	}
+	return purchaseTicketsResponse, nil
 }
 
 // ReserveOutputsForAmount returns locked spendable outpoints from the given
