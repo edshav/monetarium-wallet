@@ -2771,19 +2771,18 @@ func (s *Store) UnspentOutputCount(dbtx walletdb.ReadTx, coinType *cointype.Coin
 }
 
 // randomUTXOForCoinType returns a random unspent output for a specific coin type.
-// The skip function can be used to filter outputs.
+// The skip function can be used to filter outputs.  It returns nil only when
+// every output in the coin type's bucket is skipped.  The walk is upstream's
+// randomUTXO on the coin type's bucket.
 func (s *Store) randomUTXOForCoinType(dbtx walletdb.ReadTx, coinType cointype.CoinType,
 	skip func(k, v []byte) bool) (k, v []byte) {
 
 	ns := dbtx.ReadBucket(wtxmgrBucketKey)
-	bucketName := bucketUnspentForCoinType(coinType)
-	bucket := ns.NestedReadBucket(bucketName)
-
+	bucket := ns.NestedReadBucket(bucketUnspentForCoinType(coinType))
 	if bucket == nil {
 		return nil, nil // No UTXOs for this coin type
 	}
 
-	// Same random selection logic but on coin-type specific bucket
 	r := make([]byte, 33)
 	rand.Read(r)
 	randKey := r[:32]
@@ -2791,62 +2790,14 @@ func (s *Store) randomUTXOForCoinType(dbtx walletdb.ReadTx, coinType cointype.Co
 
 	c := bucket.ReadCursor()
 	defer c.Close()
-
-	// Seek to the random key.  If the random key is before all keys, seek
-	// to the first key.  If it is after all keys, seek to the last key.
-	// If the seek positions the cursor at the random key, this is extremely
-	// unlikely, but invalidate the random key by treating it as if it
-	// doesn't exist.
-	seekedKey, seekedValue := c.Seek(randKey)
-	if seekedKey == nil {
-		seekedKey, seekedValue = c.Last()
-		if seekedKey == nil {
-			return nil, nil
-		}
-	}
-	if bytes.Equal(seekedKey, randKey) {
-		seekedKey = nil
-	}
-
-	// Iterate through all keys in a random order beginning at the random key.
-	// If specified by the prevFirst bool, walk backwards to the beginning
-	// first, then forwards from the seeked key to the end.  Otherwise, walk
-	// forwards to the end first, then backwards from the seeked key to the
-	// beginning.
-	//
-	// While iterating, randomly skip or add keys until a random output is
-	// selected.
-	forward := func() (k, v []byte) { return c.Next() }
-	backward := func() (k, v []byte) { return c.Prev() }
-	var iter func() (k, v []byte)
+	k, v = c.Seek(randKey)
+	iter := c.Next
 	if prevFirst {
-		iter = backward
-	} else {
-		iter = forward
-	}
-	for k, v = seekedKey, seekedValue; k != nil; k, v = iter() {
-		if skip(k, v) {
-			continue
-		}
-		if rand.IntN(2) == 0 {
-			c.Close()
-			return k, v
-		}
-	}
-	if prevFirst {
-		iter = forward
-		k, v = c.Seek(randKey)
-		if bytes.Equal(k, randKey) {
-			k, v = iter()
-		}
-	} else {
-		iter = backward
-		k, v = c.Seek(randKey)
-		if bytes.Equal(k, randKey) {
-			k, v = iter()
-		}
+		iter = c.Prev
 		k, v = iter()
 	}
+
+	// Take the outputs of the first transaction with one not skipped.
 	var keys [][]byte
 	for ; k != nil; k, v = iter() {
 		if len(keys) > 0 && !bytes.Equal(keys[0][:32], k[:32]) {
@@ -2857,13 +2808,32 @@ func (s *Store) randomUTXOForCoinType(dbtx walletdb.ReadTx, coinType cointype.Co
 		}
 		keys = append(keys, append(make([]byte, 0, 36), k...))
 	}
+	// Pick random output when at least one random transaction was found.
 	if len(keys) > 0 {
-		k, v = c.Seek(keys[rand.IntN(len(keys))])
-		c.Close()
-		return k, v
+		return c.Seek(keys[rand.IntN(len(keys))])
 	}
 
-	c.Close()
+	// Search the opposite direction from the random seek key.
+	if prevFirst {
+		k, v = c.Seek(randKey)
+		iter = c.Next
+	} else {
+		c.Seek(randKey)
+		iter = c.Prev
+		k, v = iter()
+	}
+	for ; k != nil; k, v = iter() {
+		if len(keys) > 0 && !bytes.Equal(keys[0][:32], k[:32]) {
+			break
+		}
+		if skip(k, v) {
+			continue
+		}
+		keys = append(keys, append(make([]byte, 0, 36), k...))
+	}
+	if len(keys) > 0 {
+		return c.Seek(keys[rand.IntN(len(keys))])
+	}
 	return nil, nil
 }
 
