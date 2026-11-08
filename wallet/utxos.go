@@ -13,8 +13,10 @@ import (
 	"github.com/monetarium/monetarium-wallet/wallet/txauthor"
 	"github.com/monetarium/monetarium-wallet/wallet/udb"
 	"github.com/monetarium/monetarium-wallet/wallet/walletdb"
+	"github.com/monetarium/monetarium-node/chaincfg"
 	"github.com/monetarium/monetarium-node/cointype"
 	"github.com/monetarium/monetarium-node/dcrutil"
+	"github.com/monetarium/monetarium-node/txscript"
 	"github.com/monetarium/monetarium-node/txscript/stdscript"
 	"github.com/monetarium/monetarium-node/wire"
 )
@@ -51,6 +53,9 @@ func (w *Wallet) UnspentOutputs(ctx context.Context, policy OutputSelectionPolic
 		if err != nil {
 			return err
 		}
+		stakeGenMatured := func(c *udb.Credit) bool {
+			return w.txStore.StakeGenMatured(dbtx, c, tipHeight)
+		}
 
 		for _, output := range outputs {
 			// Ignore outputs that haven't reached the required
@@ -78,6 +83,12 @@ func (w *Wallet) UnspentOutputs(ctx context.Context, policy OutputSelectionPolic
 
 			// Filter by coin type - must match policy's coin type
 			if output.CoinType != policy.CoinType {
+				continue
+			}
+
+			// Leave out tickets and immature outputs: the node
+			// rejects a regular tx that spends them.
+			if !creditSpendable(w.chainParams, output, tipHeight, stakeGenMatured) {
 				continue
 			}
 
@@ -120,6 +131,40 @@ func (w *Wallet) UnspentOutputs(ctx context.Context, policy OutputSelectionPolic
 		return nil, errors.E(op, err)
 	}
 	return outputResults, nil
+}
+
+// creditSpendable reports whether a credit may be spent by a regular
+// transaction mined after tipHeight.  The rules are those of
+// MakeInputSourceWithCoinType, plus the node's coinbase maturity for any output
+// of a transaction with an expiry.  stakeGenMatured decides OP_SSGEN credits,
+// whose maturity depends on whether they are vote or SSFee outputs.
+func creditSpendable(params *chaincfg.Params, output *udb.Credit, tipHeight int32,
+	stakeGenMatured func(*udb.Credit) bool) bool {
+	txHeight := output.Height
+	coinbaseMature := coinbaseMatured(params, txHeight, tipHeight)
+	if output.HasExpiry && !coinbaseMature {
+		return false
+	}
+
+	var op byte
+	if len(output.PkScript) > 0 {
+		op = output.PkScript[0]
+	}
+	switch op {
+	case txscript.OP_SSTX:
+		// Live tickets are only spendable by SSGen, never by a regular send.
+		return false
+	case txscript.OP_SSGEN:
+		return stakeGenMatured(output)
+	case txscript.OP_SSRTX, txscript.OP_TADD, txscript.OP_TGEN:
+		return coinbaseMature
+	case txscript.OP_SSTXCHANGE:
+		return ticketChangeMatured(params, txHeight, tipHeight)
+	}
+	if output.FromCoinBase {
+		return coinbaseMature
+	}
+	return true
 }
 
 // SelectInputs selects transaction inputs to redeem unspent outputs stored in
