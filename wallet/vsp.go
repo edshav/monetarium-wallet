@@ -148,6 +148,7 @@ func (c *VSPClient) ProcessUnprocessedTickets(ctx context.Context, tickets []*VS
 // ticket is not registered with the VSP. This is used to recover VSP tracking
 // after seed restores.
 func (c *VSPClient) ProcessManagedTickets(ctx context.Context, tickets []*VSPTicket) error {
+	var errs []error
 	for _, ticket := range tickets {
 		hash := ticket.Hash()
 		c.mu.Lock()
@@ -164,29 +165,34 @@ func (c *VSPClient) ProcessManagedTickets(ctx context.Context, tickets []*VSPTic
 		status, err := c.status(ctx, ticket)
 		if err != nil {
 			if errors.Is(err, errors.Locked) {
-				return err
+				return errors.Join(append(errs, err)...)
 			}
 			continue
 		}
 
+		// Errors below are per ticket: collect them and keep going, or
+		// every later ticket would be skipped.
 		if status.FeeTxStatus == "confirmed" {
 			feeHash, err := chainhash.NewHashFromStr(status.FeeTxHash)
 			if err != nil {
-				return err
+				errs = append(errs, errors.Errorf("ticket %v: bad fee hash %q: %v", hash, status.FeeTxHash, err))
+				continue
 			}
 			err = ticket.UpdateFeeConfirmed(ctx, *feeHash, c.Client.URL, c.Client.PubKey)
 			if err != nil {
-				return err
+				errs = append(errs, errors.Errorf("ticket %v: record confirmed fee: %w", hash, err))
 			}
 			continue
 		} else if status.FeeTxHash != "" {
 			feeHash, err := chainhash.NewHashFromStr(status.FeeTxHash)
 			if err != nil {
-				return err
+				errs = append(errs, errors.Errorf("ticket %v: bad fee hash %q: %v", hash, status.FeeTxHash, err))
+				continue
 			}
 			err = ticket.UpdateFeePaid(ctx, *feeHash, c.Client.URL, c.Client.PubKey)
 			if err != nil {
-				return err
+				errs = append(errs, errors.Errorf("ticket %v: record paid fee: %w", hash, err))
+				continue
 			}
 			_ = c.feePayment(ctx, ticket, true)
 		} else {
@@ -196,7 +202,7 @@ func (c *VSPClient) ProcessManagedTickets(ctx context.Context, tickets []*VSPTic
 
 	}
 
-	return nil
+	return errors.Join(errs...)
 }
 
 // Process begins processing a VSP fee payment for a ticket.  If feeTx contains

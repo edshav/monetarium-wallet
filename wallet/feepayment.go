@@ -20,6 +20,7 @@ import (
 	"github.com/monetarium/monetarium-node/txscript/stdaddr"
 	"github.com/monetarium/monetarium-node/wire"
 	"github.com/decred/vspd/types/v3"
+	"github.com/monetarium/monetarium-wallet/wallet/walletdb"
 )
 
 var (
@@ -82,6 +83,38 @@ func (fp *vspFeePayment) removedExpiredOrSpent() bool {
 		return true
 	}
 	return false
+}
+
+// abandonFeeTx removes an unpublished fee tx from the wallet so its inputs can
+// be spent again.  A tx that is not held unpublished is left alone: the hash
+// may come from the VSP, and a tx the network may have must not be forgotten.
+func (fp *vspFeePayment) abandonFeeTx(feeHash chainhash.Hash) {
+	if feeHash == (chainhash.Hash{}) {
+		return
+	}
+	w := fp.client.wallet
+	var unpublished bool
+	err := walletdb.View(fp.ctx, w.db, func(dbtx walletdb.ReadTx) error {
+		recs, err := w.txStore.UnminedTxs(dbtx)
+		for _, rec := range recs {
+			if rec.Hash == feeHash {
+				unpublished = rec.Unpublished
+				break
+			}
+		}
+		return err
+	})
+	if err != nil || !unpublished {
+		fp.client.log.Warnf("Ticket %v: not abandoning fee tx %v: unpublished %v, err %v",
+			fp.ticket, feeHash, unpublished, err)
+		return
+	}
+	err = w.AbandonTransaction(fp.ctx, &feeHash)
+	if err != nil {
+		fp.client.log.Errorf("Ticket %v: abandon fee tx %v: %v", fp.ticket, feeHash, err)
+		return
+	}
+	fp.client.log.Infof("Ticket %v: abandoned fee tx %v", fp.ticket, feeHash)
 }
 
 func (fp *vspFeePayment) remove(reason string) {
@@ -343,6 +376,9 @@ func (fp *vspFeePayment) makeFeeTx(tx *wire.MsgTx) error {
 	feeHash := tx.TxHash()
 	err = fp.ticket.UpdateFeePaid(ctx, feeHash, fp.client.URL, fp.client.PubKey)
 	if err != nil {
+		// CreateVspPayment already added the tx to the wallet.  Abandon
+		// it, or each retry would leave another one holding inputs.
+		fp.abandonFeeTx(feeHash)
 		return err
 	}
 
@@ -466,15 +502,19 @@ func (fp *vspFeePayment) reconcilePayment() error {
 			// The VSP may still be holding the fee tx unbroadcast, so it
 			// stays unpublished until confirmPayment sees it broadcast.
 			err = nil
-		case types.ErrInvalidFeeTx, types.ErrCannotBroadcastFee:
-			err := fp.ticket.UpdateFeeErrored(ctx, fp.client.URL, fp.client.PubKey)
-			if err != nil {
-				return err
+		case types.ErrInvalidFeeTx, types.ErrCannotBroadcastFee,
+			types.ErrCannotBroadcastFeeUnknownOutputs:
+			// A failed write must not skip the abandon and the retry.
+			if markErr := fp.ticket.UpdateFeeErrored(ctx, fp.client.URL, fp.client.PubKey); markErr != nil {
+				fp.client.log.Errorf("Ticket %v: mark fee errored: %v", fp.ticket, markErr)
 			}
-			// Attempt to create a new fee transaction
+			// The VSP will not take this tx.  Abandon it so its inputs
+			// are spendable again, then make a new fee transaction.
+			fp.abandonFeeTx(feeHash)
 			fp.mu.Lock()
 			fp.feeHash = chainhash.Hash{}
 			fp.feeTx = nil
+			fp.fee = 0
 			fp.mu.Unlock()
 			// err not nilled, so reconcile payment is rescheduled.
 		}
@@ -487,6 +527,8 @@ func (fp *vspFeePayment) reconcilePayment() error {
 
 	err = fp.ticket.UpdateFeePaid(ctx, feeHash, fp.client.URL, fp.client.PubKey)
 	if err != nil {
+		// Without a timer the payment would never be retried.
+		fp.schedule("reconcile payment", fp.reconcilePayment)
 		return err
 	}
 
@@ -502,7 +544,6 @@ func (fp *vspFeePayment) reconcilePayment() error {
 
 func (fp *vspFeePayment) submitPayment() (err error) {
 	ctx := fp.ctx
-	w := fp.client.wallet
 
 	// stop processing if ticket is expired or spent
 	if fp.removedExpiredOrSpent() {
@@ -552,15 +593,17 @@ func (fp *vspFeePayment) submitPayment() (err error) {
 			// Fee has been expired, so abandon current feetx and forget
 			// the expired fee amount.  The retry then asks the VSP for a
 			// new fee and makes a new fee tx.
-			feeHash := feeTx.TxHash()
-			err := w.AbandonTransaction(ctx, &feeHash)
-			if err != nil {
-				fp.client.log.Errorf("error abandoning expired fee tx %v", err)
-			}
+			fp.abandonFeeTx(feeTx.TxHash())
 			fp.mu.Lock()
 			fp.feeTx = nil
+			fp.feeHash = chainhash.Hash{}
 			fp.fee = 0
 			fp.mu.Unlock()
+			// The abandoned tx must not stay recorded as paid: after a
+			// restart nothing would resume the payment.
+			if markErr := fp.ticket.UpdateFeeErrored(ctx, fp.client.URL, fp.client.PubKey); markErr != nil {
+				fp.client.log.Errorf("Ticket %v: mark fee errored: %v", fp.ticket, markErr)
+			}
 		}
 		return fmt.Errorf("payfee: %w", err)
 	}
