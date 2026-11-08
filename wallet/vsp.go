@@ -54,7 +54,51 @@ type VSPClient struct {
 	mu   sync.Mutex
 	jobs map[chainhash.Hash]*vspFeePayment
 
+	// lifetime is the context of background fee work. It is
+	// context.Background until SetLifetime replaces it. Guarded by mu, as is
+	// policy.MaxFee.
+	lifetime context.Context
+
 	log slog.Logger
+}
+
+// SetLifetime sets the context that fee jobs started after this call make
+// their VSP requests under, in place of context.Background. Canceling it makes
+// those requests fail; it does not remove the jobs. A request context would
+// fail them too soon. Jobs already started keep their context.
+func (c *VSPClient) SetLifetime(ctx context.Context) {
+	if ctx == nil {
+		return
+	}
+	c.mu.Lock()
+	c.lifetime = ctx
+	c.mu.Unlock()
+}
+
+// UpdateMaxFee raises the fee cap to fee if fee is higher. The VSP quotes its
+// fee from the current ticket price, so the cap of a long-lived client can fall
+// behind it. A job still running uses the new cap from its next quote; a job
+// that stopped on a fee above the cap does not restart, and its ticket needs a
+// new Process call. The cap is stored in the policy the client was created
+// with.
+func (c *VSPClient) UpdateMaxFee(fee dcrutil.Amount) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if fee > c.policy.MaxFee {
+		c.policy.MaxFee = fee
+	}
+}
+
+func (c *VSPClient) maxFee() dcrutil.Amount {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.policy.MaxFee
+}
+
+func (c *VSPClient) lifetimeCtx() context.Context {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lifetime
 }
 
 type VSPClientConfig struct {
@@ -98,11 +142,12 @@ func (w *Wallet) NewVSPClient(cfg VSPClientConfig, log slog.Logger, dialer DialF
 	}
 
 	v := &VSPClient{
-		wallet: w,
-		policy: cfg.Policy,
-		Client: client,
-		jobs:   make(map[chainhash.Hash]*vspFeePayment),
-		log:    log,
+		wallet:   w,
+		policy:   cfg.Policy,
+		Client:   client,
+		jobs:     make(map[chainhash.Hash]*vspFeePayment),
+		lifetime: context.Background(),
+		log:      log,
 	}
 	return v, nil
 }

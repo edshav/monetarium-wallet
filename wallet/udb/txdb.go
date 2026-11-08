@@ -1834,6 +1834,13 @@ func existsUnpublished(ns walletdb.ReadBucket, k []byte) bool {
 	return len(v) == 1 && v[0] != 0
 }
 
+// ExistsUnpublished reports whether hash is recorded as unpublished (signed
+// locally, not yet broadcast by this wallet — VSP fee txs live here until
+// the VSP puts them in the mempool).
+func ExistsUnpublished(ns walletdb.ReadBucket, hash *chainhash.Hash) bool {
+	return existsUnpublished(ns, hash[:])
+}
+
 func deleteUnpublished(ns walletdb.ReadWriteBucket, k []byte) error {
 	err := ns.NestedReadWriteBucket(bucketUnpublished).Delete(k)
 	if err != nil {

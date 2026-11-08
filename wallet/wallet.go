@@ -6858,6 +6858,51 @@ func (w *Wallet) GetCoinjoinTxsSumbByAcct(ctx context.Context) (map[uint32]int, 
 	return allTxsByAcct, nil
 }
 
+// TxUnpublished reports whether hash is stored as unpublished (signed locally
+// and not yet broadcast by this wallet). Mined txs are never unpublished. A
+// transaction the wallet does not hold is a NotExist error.
+func (w *Wallet) TxUnpublished(ctx context.Context, hash *chainhash.Hash) (bool, error) {
+	const op errors.Op = "wallet.TxUnpublished"
+	var unpublished bool
+	err := walletdb.View(ctx, w.db, func(dbtx walletdb.ReadTx) error {
+		ns := dbtx.ReadBucket(wtxmgrNamespaceKey)
+		if !w.txStore.ExistsTx(ns, hash) {
+			return errors.E(errors.NotExist, errors.Errorf("no transaction %v", hash))
+		}
+		unpublished = udb.ExistsUnpublished(ns, hash)
+		return nil
+	})
+	if err != nil {
+		return false, errors.E(op, err)
+	}
+	return unpublished, nil
+}
+
+// ForEachVSPTicket calls f for every VSP-managed ticket in the wallet, with
+// Host and PubKey left empty. f runs after the database transaction is
+// closed, so it may call other Wallet methods.
+func (w *Wallet) ForEachVSPTicket(ctx context.Context, f func(ticketHash chainhash.Hash, ticket *udb.VSPTicket) error) error {
+	const op errors.Op = "wallet.ForEachVSPTicket"
+	var hashes []chainhash.Hash
+	var tickets []*udb.VSPTicket
+	err := walletdb.View(ctx, w.db, func(dbtx walletdb.ReadTx) error {
+		return udb.ForEachVSPTicket(dbtx, func(hash chainhash.Hash, ticket *udb.VSPTicket) error {
+			hashes = append(hashes, hash)
+			tickets = append(tickets, ticket)
+			return nil
+		})
+	})
+	if err != nil {
+		return errors.E(op, err)
+	}
+	for i := range hashes {
+		if err := f(hashes[i], tickets[i]); err != nil {
+			return errors.E(op, err)
+		}
+	}
+	return nil
+}
+
 // GetVSPTicketsByFeeStatus returns the ticket hashes of tickets with the
 // informed fee status.
 func (w *Wallet) GetVSPTicketsByFeeStatus(ctx context.Context, feeStatus int) ([]chainhash.Hash, error) {
@@ -6914,6 +6959,22 @@ func (w *Wallet) VSPFeeHashForTicket(ctx context.Context, ticketHash *chainhash.
 		err = errors.E(errors.NotExist)
 	}
 	return feeHash, err
+}
+
+// VSPTicket returns the wallet-db VSP record for a ticket. Host may be
+// empty when the vsphost row is missing; FeeHash can still be set.
+func (w *Wallet) VSPTicket(ctx context.Context, ticketHash *chainhash.Hash) (*udb.VSPTicket, error) {
+	const op errors.Op = "wallet.VSPTicket"
+	var ticket *udb.VSPTicket
+	err := walletdb.View(ctx, w.db, func(dbtx walletdb.ReadTx) error {
+		var err error
+		ticket, err = udb.GetVSPTicket(dbtx, *ticketHash)
+		return err
+	})
+	if err != nil {
+		return nil, errors.E(op, err)
+	}
+	return ticket, nil
 }
 
 // VSPHostForTicket returns the current vsp host associated with VSP Ticket.

@@ -125,7 +125,7 @@ func (c *VSPClient) feePayment(ctx context.Context, ticket *VSPTicket, paidConfi
 
 	fp = &vspFeePayment{
 		client: c,
-		ctx:    context.Background(),
+		ctx:    c.lifetimeCtx(),
 		ticket: ticket,
 		policy: c.policy,
 		params: c.wallet.chainParams,
@@ -272,9 +272,9 @@ func (fp *vspFeePayment) receiveFeeAddress() error {
 	}
 
 	fp.client.log.Infof("VSP requires fee %v", feeAmount)
-	if feeAmount > fp.policy.MaxFee {
+	if maxFee := fp.client.maxFee(); feeAmount > maxFee {
 		return fmt.Errorf("server fee amount too high: %v > %v",
-			feeAmount, fp.policy.MaxFee)
+			feeAmount, maxFee)
 	}
 
 	// TODO: validate server timestamp.
