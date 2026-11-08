@@ -20,6 +20,7 @@ import (
 	"github.com/monetarium/monetarium-node/txscript/stdaddr"
 	"github.com/monetarium/monetarium-node/wire"
 	"github.com/decred/slog"
+	"github.com/decred/vspd/types/v3"
 	vspd "github.com/decred/vspd/client/v4"
 	mondstdaddr "github.com/decred/dcrd/txscript/v4/stdaddr"
 )
@@ -295,11 +296,15 @@ func (c *VSPClient) SetVoteChoice(ctx context.Context, ticket *VSPTicket,
 	// Retrieve current voting preferences from VSP.
 	status, err := c.status(ctx, ticket)
 	if err != nil {
-		if errors.Is(err, errors.Locked) {
-			return err
+		// A ticket the VSP does not know has no choices there to update.
+		// Otherwise the VSP keeps the previous choices, so this is not a
+		// success.
+		var apiErr types.ErrorResponse
+		if errors.As(err, &apiErr) && apiErr.Code == types.ErrUnknownTicket {
+			c.log.Warnf("VSP %s does not know ticket %s", c.Client.URL, ticket)
+			return nil
 		}
-		c.log.Errorf("Could not check status of VSP ticket %s: %v", ticket, err)
-		return nil
+		return fmt.Errorf("status of ticket %s at VSP %s: %w", ticket, c.Client.URL, err)
 	}
 
 	// Check for any mismatch between the provided voting preferences and the

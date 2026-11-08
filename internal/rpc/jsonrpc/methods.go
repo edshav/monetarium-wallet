@@ -6788,8 +6788,8 @@ func (s *Server) updateVSPVoteChoices(ctx context.Context, w *wallet.Wallet, tic
 			return err
 		}
 
-		// Never return errors here, so all tickets are tried.
-		// The first error will be returned to the user.
+		// ForUnspentUnexpiredTickets still tries every ticket and
+		// returns all errors joined.
 		err = vspClient.SetVoteChoice(ctx, ticket, choices, tspendPolicy, treasuryPolicy)
 		if err != nil {
 			return err
