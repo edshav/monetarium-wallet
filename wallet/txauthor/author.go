@@ -600,9 +600,7 @@ func newUnsignedTransaction(coinType cointype.CoinType, outputs []*wire.TxOut,
 // of outputs + fee-for-a-change-bearing-tx — but that total still covers the
 // outputs plus the fee of the CHANGE-LESS serialization. The whole leftover
 // (inputs − outputs) becomes the fee: at least the change-less minimum, and
-// less than the with-change fee the caller just failed against, so the
-// overpay is bounded by the fee cost of carrying a change output (~36 bytes'
-// worth — hundreds of VAR atoms, fractions of an SKA).
+// less than the with-change fee the caller just failed against.
 //
 // Without this, amounts in the narrow band between "spendable − sweepFee"
 // and "spendable − changeFee" were unsendable with sender-pays-fee: the loop
@@ -690,8 +688,12 @@ func RandomizeOutputPosition(outputs []*wire.TxOut, index int) int {
 }
 
 // RandomizeChangePosition randomizes the position of an authored transaction's
-// change output.  This should be done before signing.
+// change output.  This should be done before signing.  It does nothing for a
+// tx without change.
 func (tx *AuthoredTx) RandomizeChangePosition() {
+	if tx.ChangeIndex < 0 {
+		return
+	}
 	tx.ChangeIndex = RandomizeOutputPosition(tx.Tx.TxOut, tx.ChangeIndex)
 }
 

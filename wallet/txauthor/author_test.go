@@ -201,16 +201,13 @@ func TestNewUnsignedTransaction(t *testing.T) {
 		inputSource := makeInputSource(test.UnspentOutputs)
 		tx, err := txauthor.NewUnsignedTransaction(test.Outputs, test.RelayFee, inputSource, changeSource, chaincfg.MainNetParams().MaxTxSize, -1)
 		if err != nil {
-			insufficientBalance := errors.Is(err, errors.InsufficientBalance)
-			if insufficientBalance != test.InputSourceError {
-				if !test.InputSourceError {
-					t.Errorf("Test %d: InsufficientBalance=%v expected %v", i, insufficientBalance, test.InputSourceError)
-				}
-				continue
-			} else if !insufficientBalance {
+			if !test.InputSourceError || !errors.Is(err, errors.InsufficientBalance) {
 				t.Errorf("Test %d: Unexpected error: %v", i, err)
-				continue
 			}
+			continue
+		}
+		if test.InputSourceError {
+			t.Errorf("Test %d: authored a tx, expected InsufficientBalance", i)
 			continue
 		}
 		if tx.ChangeIndex < 0 {
@@ -286,6 +283,7 @@ func TestChangelessDeadZoneRescue(t *testing.T) {
 	if fee != leftover {
 		t.Fatalf("fee = %v, want the whole leftover %v", fee, leftover)
 	}
+	checkRescued(t, tx, cointype.CoinTypeVAR, inputSizes, outputs)
 
 	// One atom below the change-less minimum: not fundable in any shape —
 	// the rescue must not relax the InsufficientBalance verdict.
