@@ -5872,10 +5872,10 @@ func (w *Wallet) CreateVspPayment(ctx context.Context, tx *wire.MsgTx, fee dcrut
 		input += in.ValueIn
 	}
 	for input < int64(need(len(tx.TxIn))) {
-		// 0-conf: a ticket buy just spent the confirmed UTXOs and the
-		// change is still unmined. Waiting for 1 conf left unpaid fees
-		// stuck until the next block.
-		const minconf = 0
+		// Mined outputs only: a fee tx resting on an unmined payment
+		// that never mines cannot be broadcast.  Caller inputs are not
+		// filtered.
+		const minconf = 1
 		// VSP fees are paid in VAR (staking is VAR-only)
 		extra, err := w.ReserveOutputsForAmount(ctx, feeAcct,
 			need(len(tx.TxIn))-dcrutil.Amount(input), cointype.Zero(), minconf, cointype.CoinTypeVAR)
