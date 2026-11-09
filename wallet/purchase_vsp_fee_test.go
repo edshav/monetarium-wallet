@@ -20,6 +20,7 @@ import (
 	"github.com/monetarium/monetarium-node/chaincfg/chainhash"
 	"github.com/monetarium/monetarium-node/cointype"
 	"github.com/monetarium/monetarium-node/dcrutil"
+	"github.com/monetarium/monetarium-node/gcs/blockcf2"
 	"github.com/monetarium/monetarium-node/txscript/stdaddr"
 	"github.com/monetarium/monetarium-node/wire"
 	"github.com/monetarium/monetarium-wallet/errors"
@@ -201,11 +202,69 @@ func (n publishNetwork) PublishTransactions(_ context.Context, txs ...*wire.MsgT
 // time the split is published: once it is recorded they are spendable
 // credits, and a concurrent spend could select them.
 func TestPurchaseTicketsFundsVSPFeeFromSplit(t *testing.T) {
+	t.Run("below SVH", func(t *testing.T) {
+		testPurchaseTicketsFundsVSPFeeFromSplit(t, 2, 0, 0)
+	})
+	// Past StakeValidationHeight the wallet's estimate is above 0, and at a
+	// ticket price of 0.1 VAR the fee output is not dust.  1 is the
+	// purchaseticket RPC's default minconf.
+	t.Run("past SVH, minconf 1", func(t *testing.T) {
+		svh := uint32(basicWalletConfig.Params.StakeValidationHeight)
+		testPurchaseTicketsFundsVSPFeeFromSplit(t, svh, 1e7, 1)
+	})
+}
+
+// mine extends the main chain with empty blocks up to height in one
+// ChainSwitch, each header carrying ticket price p.sbits.
+func (p *purchaseFixture) mine(ctx context.Context, t *testing.T, height uint32) {
+	t.Helper()
+	var chain []*BlockNode
+	for p.tip.Height < height {
+		header := wire.BlockHeader{
+			PrevBlock: p.tip.BlockHash(),
+			Height:    p.tip.Height + 1,
+			Bits:      p.cfg.Params.PowLimitBits,
+			SBits:     p.sbits,
+			VoteBits:  1, // approve the previous block, or its outputs are invalidated
+		}
+		filter, err := blockcf2.Regular(&wire.MsgBlock{Header: header}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		hash := header.BlockHash()
+		chain = append(chain, NewBlockNode(&header, &hash, filter))
+		p.tip = header
+	}
+	if len(chain) == 0 {
+		return
+	}
+	if _, err := p.w.ChainSwitch(ctx, &p.forest, chain, nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// testPurchaseTicketsFundsVSPFeeFromSplit mines empty blocks, then funds 16
+// outputs in each of the last two blocks up to height, each header carrying
+// ticket price sbits, and buys at minConf.  Above minconf 0 selection starts
+// with a random walk that can come back empty when the account holds only a
+// few outputs; 32 outputs make that negligible.
+func testPurchaseTicketsFundsVSPFeeFromSplit(t *testing.T, height uint32, sbits int64, minConf int32) {
 	ctx := context.Background()
 	p := newPurchaseFixture(ctx, t)
-	p.fund(ctx, t, true, 1e8)
-	p.fund(ctx, t, true, 1e8)
+	p.sbits = sbits
+	p.mine(ctx, t, height-2)
+	for p.tip.Height < height {
+		p.fund(ctx, t, true, slices.Repeat([]dcrutil.Amount{1e8}, 16)...)
+	}
 	_, needed, quote := p.setQuote(ctx, t)
+	pastSVH := int64(height) >= basicWalletConfig.Params.StakeValidationHeight
+	if pastSVH && quote <= 0 {
+		t.Fatalf("wallet's estimate is %v past SVH, want above 0", quote)
+	}
+	// A dust fee output would make a real node reject the split.
+	if pastSVH && txrules.IsDustAmount(quote+2*p.oneInputMinerFee(), txsizes.P2PKHPkScriptSize, p.w.RelayFee()) {
+		t.Fatalf("fee output of %v is dust", quote+2*p.oneInputMinerFee())
+	}
 
 	// The locked outpoints at each publish of each tx.
 	lockedAtPublish := make(map[wire.OutPoint][]map[outpoint]struct{})
@@ -220,7 +279,7 @@ func TestPurchaseTicketsFundsVSPFeeFromSplit(t *testing.T) {
 	const count = 2
 	resp, err := p.w.PurchaseTickets(ctx, n, &PurchaseTicketsRequest{
 		Count:     count,
-		MinConf:   0,
+		MinConf:   minConf,
 		VSPClient: p.c,
 	})
 	if err != nil {
