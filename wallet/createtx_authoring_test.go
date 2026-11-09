@@ -134,8 +134,22 @@ func TestNewUnsignedTransactionWithSFFA(t *testing.T) {
 			// One and a half units: needs two inputs and leaves change.
 			amount := new(big.Int).Div(new(big.Int).Mul(f.unit, big.NewInt(3)), big.NewInt(2))
 
-			for _, idx := range []int{-1, 0} {
-				outputs := []*wire.TxOut{f.out(amount)}
+			quarter := new(big.Int).Div(f.unit, big.NewInt(4))
+			for _, tc := range []struct {
+				idx     int
+				amounts []*big.Int
+			}{
+				{-1, []*big.Int{amount}},
+				{0, []*big.Int{amount}},
+				// The fee output sits between two others, so an index
+				// collapsed to 0 or moved to the last output fails.
+				{1, []*big.Int{quarter, quarter, quarter}},
+			} {
+				idx := tc.idx
+				var outputs []*wire.TxOut
+				for _, a := range tc.amounts {
+					outputs = append(outputs, f.out(a))
+				}
 				var tx *txauthor.AuthoredTx
 				var err error
 				if idx < 0 {
@@ -149,23 +163,25 @@ func TestNewUnsignedTransactionWithSFFA(t *testing.T) {
 				if err != nil {
 					t.Fatalf("idx %d: %v", idx, err)
 				}
-				if tx.ChangeIndex < 0 {
-					t.Fatalf("idx %d: no change output", idx)
+				if tx.ChangeIndex != len(outputs) {
+					t.Fatalf("idx %d: change index %d, want %d", idx, tx.ChangeIndex, len(outputs))
 				}
 				fee := authoredFee(ctx, t, f.w, tx, ct.coinType)
 				if fee.Sign() <= 0 {
 					t.Fatalf("idx %d: fee %v", idx, fee)
 				}
-				recipient := outValue(tx.Tx.TxOut[1-tx.ChangeIndex])
-				want := new(big.Int).Set(amount)
-				if idx == 0 {
-					want.Sub(want, fee)
-				}
-				if recipient.Cmp(want) != 0 {
-					t.Errorf("idx %d: recipient gets %v, want %v (fee %v)", idx, recipient, want, fee)
-				}
-				if outValue(outputs[0]).Cmp(amount) != 0 {
-					t.Errorf("idx %d: caller's output was modified", idx)
+				for i, a := range tc.amounts {
+					got := outValue(tx.Tx.TxOut[i])
+					want := new(big.Int).Set(a)
+					if i == idx {
+						want.Sub(want, fee)
+					}
+					if got.Cmp(want) != 0 {
+						t.Errorf("idx %d: output %d gets %v, want %v (fee %v)", idx, i, got, want, fee)
+					}
+					if outValue(outputs[i]).Cmp(a) != 0 {
+						t.Errorf("idx %d: caller's output %d was modified", idx, i)
+					}
 				}
 			}
 
