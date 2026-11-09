@@ -5,10 +5,14 @@
 package wallet
 
 import (
+	"bytes"
 	"context"
+	"encoding/hex"
+	"encoding/json"
 	"math/big"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,9 +21,12 @@ import (
 	"github.com/monetarium/monetarium-node/chaincfg/chainhash"
 	"github.com/monetarium/monetarium-node/cointype"
 	"github.com/monetarium/monetarium-node/dcrutil"
+	"github.com/monetarium/monetarium-node/gcs/blockcf2"
 	"github.com/monetarium/monetarium-node/txscript/stdaddr"
 	"github.com/monetarium/monetarium-node/wire"
 	"github.com/monetarium/monetarium-wallet/errors"
+	"github.com/monetarium/monetarium-wallet/wallet/txrules"
+	"github.com/monetarium/monetarium-wallet/wallet/udb"
 )
 
 // publishRecorder is a mockNetwork that keeps every published tx.
@@ -47,10 +54,54 @@ const noSpendableVAR = "has no spendable VAR"
 // TestPurchaseTicketsVSPSingleUTXO checks that a non-mixed VSP purchase from a
 // wallet with one spendable output publishes the ticket: the fee split spends
 // that output, and the retry at minconf 0 funds the ticket from the split's
-// unmined change.
+// unmined change. When the VSP accepts the fee, the fee tx spends the split's
+// output reserved for it and the ticket is recorded as paid.
 func TestPurchaseTicketsVSPSingleUTXO(t *testing.T) {
+	for _, accept := range []bool{false, true} {
+		name := "VSP fails"
+		if accept {
+			name = "VSP accepts the fee"
+		}
+		t.Run(name, func(t *testing.T) { testPurchaseTicketsVSPSingleUTXO(t, accept) })
+	}
+}
+
+func testPurchaseTicketsVSPSingleUTXO(t *testing.T, accept bool) {
 	ctx := context.Background()
-	c := testVSPClient(ctx, t, failingFeeVSP)
+	feeAddr, err := stdaddr.NewAddressPubKeyHashEcdsaSecp256k1V0(
+		make([]byte, 20), basicWalletConfig.Params)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var quote dcrutil.Amount
+	var paid []*wire.MsgTx
+	reply := failingFeeVSP
+	if accept {
+		reply = func(path string, body []byte) (int, any) {
+			mu.Lock()
+			defer mu.Unlock()
+			switch path {
+			case "/api/v3/feeaddress":
+				return http.StatusOK, types.FeeAddressResponse{Timestamp: time.Now().Unix(),
+					FeeAddress: feeAddr.String(), FeeAmount: int64(quote), Request: body}
+			case "/api/v3/payfee":
+				var req types.PayFeeRequest
+				if err := json.Unmarshal(body, &req); err != nil {
+					return apiError(types.ErrBadRequest)
+				}
+				raw, err := hex.DecodeString(req.FeeTx)
+				tx := new(wire.MsgTx)
+				if err != nil || tx.FromBytes(raw) != nil {
+					return apiError(types.ErrBadRequest)
+				}
+				paid = append(paid, tx)
+				return http.StatusOK, types.PayFeeResponse{Timestamp: time.Now().Unix(), Request: body}
+			}
+			return failingFeeVSP(path, body)
+		}
+	}
+	c := testVSPClient(ctx, t, reply)
 	w := c.wallet
 	var published []*wire.MsgTx
 	n := publishRecorder{txs: &published}
@@ -65,26 +116,126 @@ func TestPurchaseTicketsVSPSingleUTXO(t *testing.T) {
 	ver, script := addr.PaymentScript()
 	fund.AddTxOut(&wire.TxOut{Value: 2e8, Version: ver, PkScript: script})
 	blockOne := maketg(t, w.chainParams).createBlockOne("block-one")
-	_, err = w.ChainSwitch(ctx, new(SidechainForest), []*BlockNode{blockOne.BlockNode},
+	// Extend the chain to stake validation height, where the vote subsidy,
+	// and with it the VSP fee, is no longer zero.  At a ticket price of
+	// 0.1 VAR the fee is not dust.
+	chain := []*BlockNode{blockOne.BlockNode}
+	for tip := blockOne.MsgBlock.Header; int64(tip.Height) < w.chainParams.StakeValidationHeight; {
+		header := wire.BlockHeader{
+			PrevBlock: tip.BlockHash(),
+			Height:    tip.Height + 1,
+			Bits:      w.chainParams.PowLimitBits,
+			SBits:     1e7,
+			VoteBits:  dcrutil.BlockValid, // keep block one's funding tx valid
+		}
+		filter, err := blockcf2.Regular(&wire.MsgBlock{Header: header}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		hash := header.BlockHash()
+		chain = append(chain, NewBlockNode(&header, &hash, filter))
+		tip = header
+	}
+	_, err = w.ChainSwitch(ctx, new(SidechainForest), chain,
 		map[chainhash.Hash][]*wire.MsgTx{*blockOne.Hash: {fund}})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	_, err = w.PurchaseTickets(ctx, n, &PurchaseTicketsRequest{
+	// Quote the largest fee the split's fee output covers: the wallet's own
+	// estimate.  vspd quotes slightly less, with a fixed relay fee.
+	sdiff, err := w.NextStakeDifficulty(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, height := w.MainChainTip(ctx)
+	mu.Lock()
+	quote = txrules.StakePoolTicketFee(sdiff, w.RelayFee(), height, 1, w.chainParams, true, true)
+	mu.Unlock()
+	feeScriptVer, feeScript := feeAddr.PaymentScript()
+	quoteOut := &wire.TxOut{Value: int64(quote), Version: feeScriptVer, PkScript: feeScript}
+	if quote <= 0 || txrules.IsDustOutput(quoteOut, w.RelayFee()) {
+		t.Fatalf("test setup: VSP fee %v at height %d, sdiff %v, want above dust", quote, height, sdiff)
+	}
+
+	resp, err := w.PurchaseTickets(ctx, n, &PurchaseTicketsRequest{
 		Count:     1,
 		MinConf:   1,
 		VSPClient: c,
 	})
 	var tickets int
+	var extraSplit *wire.MsgTx
+	fundOut := wire.OutPoint{Hash: fund.TxHash()}
 	for _, tx := range published {
 		if stake.IsSStx(tx) {
 			tickets++
+		}
+		for _, in := range tx.TxIn {
+			if in.PreviousOutPoint == fundOut {
+				extraSplit = tx
+			}
 		}
 	}
 	if tickets != 1 {
 		t.Fatalf("published %d tickets of %d txs, want 1 (PurchaseTickets error: %v)",
 			tickets, len(published), err)
+	}
+	if !accept {
+		return
+	}
+	if err != nil {
+		t.Fatalf("PurchaseTickets: %v", err)
+	}
+	if extraSplit == nil {
+		t.Fatal("no published tx spends the funding output")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	// The scheduled reconcile may resubmit the same fee tx.
+	if len(paid) == 0 {
+		t.Fatal("VSP received no fee tx")
+	}
+	feeTx := paid[0]
+	for _, tx := range paid[1:] {
+		if tx.TxHash() != feeTx.TxHash() {
+			t.Fatalf("VSP received fee txs %v and %v, want one", feeTx.TxHash(), tx.TxHash())
+		}
+	}
+	if len(feeTx.TxIn) != 1 {
+		t.Fatalf("fee tx has %d inputs, want 1", len(feeTx.TxIn))
+	}
+	feeIn := feeTx.TxIn[0].PreviousOutPoint
+	if feeIn.Hash != extraSplit.TxHash() {
+		t.Fatalf("fee tx spends %v, want an output of the fee split %v", &feeIn, extraSplit.TxHash())
+	}
+	for _, tx := range published {
+		for _, in := range tx.TxIn {
+			if in.PreviousOutPoint == feeIn {
+				t.Fatalf("fee input %v is also spent by published tx %v", &feeIn, tx.TxHash())
+			}
+		}
+	}
+	var toVSP dcrutil.Amount
+	for _, out := range feeTx.TxOut {
+		if out.Version == feeScriptVer && bytes.Equal(out.PkScript, feeScript) {
+			toVSP += dcrutil.Amount(out.Value)
+		}
+	}
+	if toVSP != quote {
+		t.Errorf("fee tx pays the VSP %v, want the quote %v", toVSP, quote)
+	}
+	ticket, err := w.NewVSPTicket(ctx, resp.TicketHashes[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := ticket.VSPTicketInfo(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.FeeTxStatus != uint32(udb.VSPFeeProcessPaid) || info.FeeHash != feeTx.TxHash() {
+		t.Errorf("ticket fee status %d hash %v, want paid (%d) with %v",
+			info.FeeTxStatus, info.FeeHash, udb.VSPFeeProcessPaid, feeTx.TxHash())
 	}
 }
 
