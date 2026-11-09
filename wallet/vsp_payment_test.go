@@ -349,12 +349,27 @@ func TestCreateVspPaymentFunding(t *testing.T) {
 		}
 	})
 
-	t.Run("unmined change", func(t *testing.T) {
+	t.Run("unmined output", func(t *testing.T) {
 		ctx := context.Background()
 		f := newVSPPaymentFixture(ctx, t)
 		f.fund(ctx, t, false, 1e8)
-		if err := f.pay(ctx, t, wire.NewMsgTx(), fee); err != nil {
-			t.Fatalf("unmined output not used: %v", err)
+		checkUnpaid(ctx, t, f.w, f.pay(ctx, t, wire.NewMsgTx(), fee), 1)
+	})
+
+	t.Run("unmined caller input", func(t *testing.T) {
+		ctx := context.Background()
+		f := newVSPPaymentFixture(ctx, t)
+		v := fee + f.oneInputMinerFee()
+		unmined := f.fund(ctx, t, false, v)
+		op := wire.NewOutPoint(unmined.CachedTxHash(), 0, wire.TxTreeRegular)
+		f.w.LockOutpoint(&op.Hash, op.Index) // as the purchase does
+		tx := wire.NewMsgTx()
+		tx.AddTxIn(wire.NewTxIn(op, int64(v), nil))
+		if err := f.pay(ctx, t, tx, fee); err != nil {
+			t.Fatal(err)
+		}
+		if len(tx.TxIn) != 1 {
+			t.Errorf("%d inputs, want the caller's alone", len(tx.TxIn))
 		}
 	})
 
@@ -462,7 +477,8 @@ func TestVSPProcessFundsFeeTx(t *testing.T) {
 				params: c.wallet.chainParams,
 			}
 
-			f := &vspPaymentFixture{w: c.wallet}
+			f := &vspPaymentFixture{w: c.wallet, cfg: basicWalletConfig,
+				tip: basicWalletConfig.Params.GenesisBlock.Header}
 			var feeTx *wire.MsgTx
 			var callerOp *wire.OutPoint
 			if tc.callerInput {
@@ -473,7 +489,7 @@ func TestVSPProcessFundsFeeTx(t *testing.T) {
 				feeTx.AddTxIn(wire.NewTxIn(callerOp, int64(fee/2), nil))
 			}
 			if !tc.unfunded {
-				f.fund(ctx, t, false, 1e8)
+				f.fund(ctx, t, true, 1e8)
 			}
 			before := lockedOutpoints(ctx, t, c.wallet)
 			unmined := unminedTxs(ctx, t, c.wallet)
