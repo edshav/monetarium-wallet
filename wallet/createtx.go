@@ -1665,8 +1665,9 @@ var errVSPFeeRequiresUTXOSplit = errors.New("paying VSP fee requires UTXO split"
 // ErrVSPFeeNotPaid is joined into the error PurchaseTickets returns when the
 // tickets were published but the VSP fee for one or more of them was not paid
 // by that call.  The response is non-nil and holds every published ticket
-// hash.  The fee may still be paid: the wallet can have scheduled a retry, or
-// the VSP may have received it.
+// hash, and each fee error joined with it names its ticket hash.  The fee may
+// still be paid: the wallet can have scheduled a retry, or the VSP may have
+// received it.
 var ErrVSPFeeNotPaid = errors.New("tickets published but VSP fee not paid")
 
 // purchaseTickets indicates to the wallet that a ticket should be purchased
@@ -2207,7 +2208,7 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 		if err != nil {
 			unlock()
 			log.Errorf("VSP ticket record for published %v failed: %v", ticketHash, err)
-			feeErrs = append(feeErrs, err)
+			feeErrs = append(feeErrs, errors.Errorf("ticket %v: %w", ticketHash, err))
 			continue
 		}
 
@@ -2219,7 +2220,7 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 			// paid with processunmanagedticket.
 			if err != nil {
 				log.Errorf("VSP fee for published ticket %v failed: %v", ticketHash, err)
-				feeErrs = append(feeErrs, err)
+				feeErrs = append(feeErrs, errors.Errorf("ticket %v: %w", ticketHash, err))
 			}
 			continue
 		}
