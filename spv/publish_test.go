@@ -17,6 +17,7 @@ import (
 	"github.com/monetarium/monetarium-node/wire"
 	"github.com/monetarium/monetarium-wallet/errors"
 	"github.com/monetarium/monetarium-wallet/p2p"
+	"github.com/monetarium/monetarium-wallet/wallet"
 )
 
 // connectRecordingPeer connects to a remote peer that passes on the tx and inv
@@ -112,29 +113,52 @@ func receivedTx(t *testing.T, received <-chan wire.Message, tx *wire.MsgTx) {
 	}
 }
 
+// parentAndChild records in w an unmined payment to script and a signed
+// unmined spend of it.
+func parentAndChild(t *testing.T, w *wallet.Wallet, version uint16, script []byte, ct cointype.CoinType) []*wire.MsgTx {
+	t.Helper()
+	ctx := context.Background()
+	parent := payment(version, script, ct, 1)
+	if err := w.AddTransaction(ctx, parent, (*chainhash.Hash)(nil)); err != nil {
+		t.Fatal(err)
+	}
+	child := spendOf(t, w, parent, script, nil)
+	if err := w.AddTransaction(ctx, child, (*chainhash.Hash)(nil)); err != nil {
+		t.Fatal(err)
+	}
+	return []*wire.MsgTx{parent, child}
+}
+
+// receivedAll checks that rp was sent every one of txs itself, in order, and
+// would serve a getdata for each.
+func receivedAll(t *testing.T, rp *p2p.RemotePeer, received <-chan wire.Message, txs []*wire.MsgTx) {
+	t.Helper()
+	for _, tx := range txs {
+		receivedTx(t, received, tx)
+		if !rp.InvsSent().Contains(tx.TxHash()) {
+			t.Errorf("%v would not serve a getdata for %v", rp, tx.TxHash())
+		}
+	}
+}
+
 // TestPublishTransactionsPushesTransactions checks that PublishTransactions
-// sends the transaction itself to every connected peer, rather than an inv a
-// peer may ignore, and still serves a getdata for it.
+// sends every transaction itself, in order, to every connected peer, rather
+// than an inv a peer may ignore, and still serves a getdata for them.
 func TestPublishTransactionsPushesTransactions(t *testing.T) {
 	for _, ct := range []cointype.CoinType{cointype.CoinTypeVAR, 1} {
 		t.Run(ct.String(), func(t *testing.T) {
-			_, version, script, syncer := txInvsWallet(t)
+			w, version, script, syncer := txInvsWallet(t)
+			txs := parentAndChild(t, w, version, script, ct)
 			s := syncer()
 			a, aReceived := connectRecordingPeer(t, false)
 			b, bReceived := connectRecordingPeer(t, false)
 			s.remotes = map[string]*p2p.RemotePeer{"a": a, "b": b}
 
-			tx := payment(version, script, ct, 1)
-			if err := s.PublishTransactions(context.Background(), tx); err != nil {
+			if err := s.PublishTransactions(context.Background(), txs...); err != nil {
 				t.Fatal(err)
 			}
-			receivedTx(t, aReceived, tx)
-			receivedTx(t, bReceived, tx)
-			for _, rp := range []*p2p.RemotePeer{a, b} {
-				if !rp.InvsSent().Contains(tx.TxHash()) {
-					t.Errorf("%v would not serve a getdata for the tx", rp)
-				}
-			}
+			receivedAll(t, a, aReceived, txs)
+			receivedAll(t, b, bReceived, txs)
 		})
 	}
 }
@@ -214,17 +238,15 @@ func TestPublishTransactionsSurvivesDeadPeers(t *testing.T) {
 	}
 }
 
-// TestPeerStartupResendsUnmined checks that a newly connected peer gets the
-// wallet's unmined transactions themselves, rather than an inv.
+// TestPeerStartupResendsUnmined checks that a newly connected peer gets every
+// unmined wallet transaction itself, a parent before its child, rather than
+// an inv.
 func TestPeerStartupResendsUnmined(t *testing.T) {
 	for _, ct := range []cointype.CoinType{cointype.CoinTypeVAR, 1} {
 		t.Run(ct.String(), func(t *testing.T) {
 			ctx := context.Background()
 			w, version, script, syncer := txInvsWallet(t)
-			tx := payment(version, script, ct, 1)
-			if err := w.AddTransaction(ctx, tx, (*chainhash.Hash)(nil)); err != nil {
-				t.Fatal(err)
-			}
+			txs := parentAndChild(t, w, version, script, ct)
 			s := syncer()
 			s.initialSyncDone = make(chan struct{})
 			close(s.initialSyncDone)
@@ -233,7 +255,7 @@ func TestPeerStartupResendsUnmined(t *testing.T) {
 			if err := s.peerStartup(ctx, rp); err != nil {
 				t.Fatal(err)
 			}
-			receivedTx(t, received, tx)
+			receivedAll(t, rp, received, txs)
 		})
 	}
 }
