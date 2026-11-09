@@ -567,3 +567,45 @@ func TestCurrentAddressAndPersistConcurrent(t *testing.T) {
 		}
 	}
 }
+
+// TestCurrentAddressAndPersistConcurrentFirstCall checks that concurrent
+// calls on an account with no remembered address all return one address.
+func TestCurrentAddressAndPersistConcurrentFirstCall(t *testing.T) {
+	ctx := context.Background()
+	cfg := basicWalletConfig
+	w, teardown := testWallet(ctx, t, &cfg, nil)
+	defer teardown()
+
+	const n = 8
+	addrs := make([]string, n)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			addr, err := w.CurrentAddressAndPersist(ctx, 0)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			addrs[i] = addr.String()
+		}()
+	}
+	close(start)
+	wg.Wait()
+	for i := 1; i < n; i++ {
+		if addrs[i] != addrs[0] {
+			t.Fatalf("concurrent calls returned %v and %v", addrs[0], addrs[i])
+		}
+	}
+	// Only one index was used up.
+	next, err := w.NewExternalAddress(ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if child := next.(*xpubAddress).child; child != 1 {
+		t.Errorf("next address is child %d, want 1", child)
+	}
+}

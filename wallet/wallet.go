@@ -226,6 +226,10 @@ type Wallet struct {
 	addressBuffers   map[uint32]*bip0044AccountData
 	addressBuffersMu sync.Mutex
 
+	// currentAddressMu serializes CurrentAddressAndPersist, so concurrent
+	// calls take one new address.  It is taken before addressBuffersMu.
+	currentAddressMu sync.Mutex
+
 	// Passphrase unlock
 	passphraseUsedMu        sync.RWMutex
 	passphraseTimeoutMu     sync.Mutex
@@ -2823,6 +2827,9 @@ func (w *Wallet) CurrentAddress(account uint32) (stdaddr.Address, error) {
 // is returned.
 func (w *Wallet) CurrentAddressAndPersist(ctx context.Context, account uint32) (stdaddr.Address, error) {
 	const op errors.Op = "wallet.CurrentAddressAndPersist"
+
+	w.currentAddressMu.Lock()
+	defer w.currentAddressMu.Unlock()
 
 	// Return the address handed out here last while it is unused: a new one
 	// on every call would use up the gap limit.
