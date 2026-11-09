@@ -2201,11 +2201,8 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 			continue
 		}
 
-		// Process may also succeed without feeTx, when the VSP already
-		// holds a fee tx for the ticket.
-		err = req.VSPClient.Process(ctx, ticket, feeTx)
+		err = w.payPurchaseFee(ctx, req.VSPClient, ticket, feeTx, vspFeeCredits[i])
 		if err != nil || len(feeTx.TxOut) == 0 {
-			unlock()
 			continue
 		}
 		// watch for outpoints change.
@@ -2216,6 +2213,30 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 	}
 
 	return purchaseTicketsResponse, err
+}
+
+// payPurchaseFee has c process the fee of a ticket just purchased, offering
+// feeTx, which spends the inputs reserved for the fee.  It unlocks them all if
+// Process fails, and otherwise those the paid fee tx does not spend: Process
+// may leave feeTx unused, when the VSP already holds a fee tx for the ticket,
+// or pay the fee tx a scheduled attempt made from other inputs, copied into
+// feeTx.  Recording a fee tx in the wallet unlocks the inputs it spends.
+func (w *Wallet) payPurchaseFee(ctx context.Context, c *VSPClient, ticket *VSPTicket,
+	feeTx *wire.MsgTx, reserved []Input) error {
+
+	err := c.Process(ctx, ticket, feeTx)
+	spent := make(map[wire.OutPoint]bool)
+	if err == nil && len(feeTx.TxOut) != 0 {
+		for _, in := range feeTx.TxIn {
+			spent[in.PreviousOutPoint] = true
+		}
+	}
+	for _, in := range reserved {
+		if !spent[in.OutPoint] {
+			w.UnlockOutpoint(&in.OutPoint.Hash, in.OutPoint.Index)
+		}
+	}
+	return err
 }
 
 // ReserveOutputsForAmount returns locked spendable outpoints from the given
