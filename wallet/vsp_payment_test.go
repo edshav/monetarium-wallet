@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"math/big"
 	"net/http"
 	"strconv"
 	"sync/atomic"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/decred/vspd/types/v3"
 	"github.com/monetarium/monetarium-node/chaincfg/chainhash"
+	"github.com/monetarium/monetarium-node/cointype"
 	"github.com/monetarium/monetarium-node/dcrutil"
 	"github.com/monetarium/monetarium-node/gcs/blockcf2"
 	"github.com/monetarium/monetarium-node/txscript/stdaddr"
@@ -55,8 +57,15 @@ func newVSPPaymentFixture(ctx context.Context, t *testing.T) *vspPaymentFixture 
 	return f
 }
 
-// fund adds a tx paying the wallet one output per value and returns it.
+// fund adds a tx paying the wallet one VAR output per value and returns it.
 func (f *vspPaymentFixture) fund(ctx context.Context, t *testing.T, mined bool, values ...dcrutil.Amount) *wire.MsgTx {
+	t.Helper()
+	return f.fundCoin(ctx, t, mined, cointype.CoinTypeVAR, values...)
+}
+
+// fundCoin is fund for coinType; SKA values are in atoms of that coin.
+func (f *vspPaymentFixture) fundCoin(ctx context.Context, t *testing.T, mined bool,
+	coinType cointype.CoinType, values ...dcrutil.Amount) *wire.MsgTx {
 	t.Helper()
 	addr, err := f.w.NewInternalAddress(ctx, f.feeAcct)
 	if err != nil {
@@ -67,7 +76,11 @@ func (f *vspPaymentFixture) fund(ctx context.Context, t *testing.T, mined bool, 
 	tx := wire.NewMsgTx()
 	tx.AddTxIn(wire.NewTxIn(&wire.OutPoint{Hash: chainhash.Hash{f.n}}, 0, nil))
 	for _, v := range values {
-		tx.AddTxOut(&wire.TxOut{Value: int64(v), Version: ver, PkScript: script})
+		out := &wire.TxOut{Value: int64(v), Version: ver, PkScript: script, CoinType: coinType}
+		if coinType.IsSKA() {
+			out.Value, out.SKAValue = 0, big.NewInt(int64(v))
+		}
+		tx.AddTxOut(out)
 	}
 	if !mined {
 		if err := f.w.AddTransaction(ctx, tx, nil); err != nil {
@@ -389,6 +402,32 @@ func TestCreateVspPaymentFunding(t *testing.T) {
 		}
 		if len(tx.TxIn) < 2 || tx.TxIn[0].PreviousOutPoint.Hash != short.TxHash() {
 			t.Errorf("caller's input not kept first among %d inputs", len(tx.TxIn))
+		}
+	})
+
+	t.Run("caller inputs short of the quote, SKA1 in the fee account", func(t *testing.T) {
+		ctx := context.Background()
+		f := newVSPPaymentFixture(ctx, t)
+		short := f.fund(ctx, t, true, fee/2)
+		ska := f.fundCoin(ctx, t, true, cointype.CoinType(1), 1e8)
+		if bal, err := f.w.AccountBalanceByCoinType(ctx, f.feeAcct, cointype.CoinType(1), 1); err != nil || !bal.SKASpendable.IsPositive() {
+			t.Fatalf("SKA1 output not spendable: %v, %v", bal.SKASpendable, err)
+		}
+		f.fund(ctx, t, true, 1e8)
+		op := wire.NewOutPoint(short.CachedTxHash(), 0, wire.TxTreeRegular)
+		f.w.LockOutpoint(&op.Hash, op.Index) // as the purchase does
+		tx := wire.NewMsgTx()
+		tx.AddTxIn(wire.NewTxIn(op, int64(fee/2), nil))
+		err := f.pay(ctx, t, tx, fee)
+		// Checked before err: a top-up that reserves SKA1 adds no VAR, so
+		// the next round fails with the SKA1 input left in tx.
+		for _, in := range tx.TxIn {
+			if in.PreviousOutPoint.Hash == ska.TxHash() {
+				t.Errorf("fee tx spends SKA1 output %v", in.PreviousOutPoint)
+			}
+		}
+		if err != nil {
+			t.Fatalf("short inputs not topped up with VAR: %v", err)
 		}
 	})
 
