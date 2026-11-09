@@ -5839,7 +5839,8 @@ func (s sigDataSource) GetScript(a stdaddr.Address) ([]byte, error) { return s.s
 // CreateVspPayment receives a tx and ensures that it pays the correct fee
 // amount to the correct address. It then signs that tx and adds it to the
 // wallet without broadcasting it to the network. Inputs already in tx must be
-// locked by the caller, or topping them up may select them again.
+// locked by the caller, or topping them up may select them again.  After an
+// error tx may hold inputs the wallet no longer locks; it must not be reused.
 func (w *Wallet) CreateVspPayment(ctx context.Context, tx *wire.MsgTx, fee dcrutil.Amount,
 	feeAddr stdaddr.Address, feeAcct uint32, changeAcct uint32) error {
 
