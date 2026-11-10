@@ -184,6 +184,11 @@ func TestEmissionKeyBackupAADTamperRejected(t *testing.T) {
 		clone[idx] = newVal
 		return strings.Join(clone, ":")
 	}
+	salt, err := hex.DecodeString(parts[2])
+	if err != nil {
+		t.Fatalf("salt: %v", err)
+	}
+	salt[0] ^= 0xff
 
 	// A second valid scrypt N would also pass parsing — the AAD binding is
 	// what catches the swap. The original blob uses N=32768; swap to 16384
@@ -193,8 +198,9 @@ func TestEmissionKeyBackupAADTamperRejected(t *testing.T) {
 		blob string
 	}{
 		// salt index = 2; flip the first byte. Still hex-decodes, still
-		// non-empty, still passes parsing.
-		{"salt swap", mutateField(2, "ff"+parts[2][2:])},
+		// non-empty, still passes parsing. A fixed value would leave the
+		// blob unchanged when the random salt already starts with it.
+		{"salt swap", mutateField(2, hex.EncodeToString(salt))},
 		{"N swap", mutateField(3, "16384")},
 		{"r swap", mutateField(4, "4")},
 		{"p swap", mutateField(5, "2")},
