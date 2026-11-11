@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/decred/vspd/types/v3"
+	"github.com/monetarium/monetarium-node/blockchain/stake"
 	"github.com/monetarium/monetarium-node/chaincfg/chainhash"
 	"github.com/monetarium/monetarium-node/cointype"
 	"github.com/monetarium/monetarium-node/dcrutil"
@@ -26,6 +27,7 @@ import (
 	"github.com/monetarium/monetarium-wallet/errors"
 	"github.com/monetarium/monetarium-wallet/wallet/txrules"
 	"github.com/monetarium/monetarium-wallet/wallet/txsizes"
+	"github.com/monetarium/monetarium-wallet/wallet/udb"
 )
 
 const purchaseVSPFeePercent = 2.0
@@ -624,6 +626,93 @@ func TestPurchaseTicketsVSPQuoteAboveFeeOutput(t *testing.T) {
 	if !fromFeeOut || len(tx.TxIn) < 2 {
 		t.Errorf("fee tx has %d inputs, spends the fee output: %v; want the fee output and more",
 			len(tx.TxIn), fromFeeOut)
+	}
+}
+
+// TestPurchaseTicketsVSPQuoteNoTopUp checks a purchase whose VSP quotes more
+// than the split's fee output holds when no mined output is left to top it up:
+// the split spent the only one, and top-ups take mined outputs only.  The
+// ticket is bought, its fee is left unpaid and marked errored for the
+// scheduled retry, no fee tx is recorded, and nothing stays locked.
+func TestPurchaseTicketsVSPQuoteNoTopUp(t *testing.T) {
+	ctx := context.Background()
+	p := newPurchaseFixture(ctx, t)
+	p.fund(ctx, t, true, 1e8)
+	_, _, quote := p.setQuote(ctx, t)
+	p.mu.Lock()
+	p.quote = quote + 1e6 // above the fee output
+	p.mu.Unlock()
+
+	resp, err := p.w.PurchaseTickets(ctx, mockNetwork{}, &PurchaseTicketsRequest{
+		Count:     1,
+		MinConf:   0,
+		VSPClient: p.c,
+	})
+	// Whether the failed fee's error is returned is a separate change, so
+	// only the response is checked here.
+	if resp == nil || len(resp.TicketHashes) != 1 {
+		t.Fatalf("response %v, %v, want 1 ticket hash", resp, err)
+	}
+	if _, feeOuts := splitOutputs(t, resp); len(feeOuts) != 1 {
+		t.Fatalf("split has %d fee outputs, want 1", len(feeOuts))
+	}
+
+	p.mu.Lock()
+	asked, paid := len(p.feeTickets), len(p.paid)
+	p.mu.Unlock()
+	if asked != 1 || paid != 0 {
+		t.Errorf("VSP asked for %d fee addresses and paid %d fee txs, want 1 and none", asked, paid)
+	}
+	ticket, err := p.w.NewVSPTicket(ctx, resp.TicketHashes[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := ticket.VSPTicketInfo(ctx)
+	if err != nil || udb.FeeStatus(info.FeeTxStatus) != udb.VSPFeeProcessErrored {
+		t.Errorf("ticket fee status %+v (err %v), want errored", info, err)
+	}
+	if n := unminedTxs(ctx, t, p.w); n != 2 {
+		t.Errorf("%d unmined txs, want the split and the ticket alone", n)
+	}
+	if locked := lockedNow(p.w); len(locked) != 0 {
+		t.Errorf("outpoints left locked: %v", locked)
+	}
+}
+
+// TestPurchaseTicketsNewVSPTicketFails checks that a ticket whose VSP ticket
+// cannot be built after it is published (the wallet is locked by then) has
+// its fee output unlocked.  The VSP is never asked for a fee address.
+func TestPurchaseTicketsNewVSPTicketFails(t *testing.T) {
+	ctx := context.Background()
+	p := newPurchaseFixture(ctx, t)
+	p.fund(ctx, t, true, 1e8)
+	p.setQuote(ctx, t)
+	n := publishNetwork{publish: func(tx *wire.MsgTx) {
+		if stake.IsSStx(tx) {
+			p.w.Lock()
+		}
+	}}
+	p.w.SetNetworkBackend(n)
+
+	resp, err := p.w.PurchaseTickets(ctx, n, &PurchaseTicketsRequest{
+		Count:     1,
+		MinConf:   0,
+		VSPClient: p.c,
+	})
+	if resp == nil || len(resp.TicketHashes) != 1 {
+		t.Fatalf("response %v, %v, want 1 ticket hash", resp, err)
+	}
+	if _, feeOuts := splitOutputs(t, resp); len(feeOuts) != 1 {
+		t.Fatalf("split has %d fee outputs, want 1", len(feeOuts))
+	}
+	p.mu.Lock()
+	asked := len(p.feeTickets)
+	p.mu.Unlock()
+	if asked != 0 {
+		t.Fatalf("VSP asked for %d fee addresses, want none: the VSP ticket must fail first", asked)
+	}
+	if locked := lockedNow(p.w); len(locked) != 0 {
+		t.Errorf("outpoints left locked: %v", locked)
 	}
 }
 
