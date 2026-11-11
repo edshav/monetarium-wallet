@@ -308,23 +308,7 @@ func TestVSPPurchaseFeeUnlocksUnusedInputs(t *testing.T) {
 			if err := w.payPurchaseFee(ctx, c, ticket, purchaseTx, reserved); err != nil {
 				t.Fatal(err)
 			}
-			var unspent bool
-			err := walletdb.View(ctx, w.db, func(dbtx walletdb.ReadTx) error {
-				_, tip := w.txStore.MainChainTip(dbtx)
-				src := w.txStore.MakeInputSourceWithCoinType(dbtx, 0, 0,
-					tip, nil, cointype.CoinTypeVAR)
-				detail, err := src.SelectInputs(0, cointype.Zero())
-				if err != nil {
-					return err
-				}
-				for _, in := range detail.Inputs {
-					unspent = unspent || in.PreviousOutPoint == *reservedOp
-				}
-				return nil
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
+			unspent := testUnspentOutputs(ctx, t, w)[*reservedOp]
 			locked := w.LockedOutpoint(&reservedOp.Hash, reservedOp.Index)
 			if unspent != tc.wantUnspent || locked != tc.wantLocked {
 				t.Fatalf("reserved input unspent = %v, locked = %v; want %v, %v",
@@ -332,6 +316,29 @@ func TestVSPPurchaseFeeUnlocksUnusedInputs(t *testing.T) {
 			}
 		})
 	}
+}
+
+// testUnspentOutputs returns the wallet's spendable VAR outputs at minconf 0.
+func testUnspentOutputs(ctx context.Context, t *testing.T, w *Wallet) map[wire.OutPoint]bool {
+	t.Helper()
+	unspent := make(map[wire.OutPoint]bool)
+	err := walletdb.View(ctx, w.db, func(dbtx walletdb.ReadTx) error {
+		_, tip := w.txStore.MainChainTip(dbtx)
+		src := w.txStore.MakeInputSourceWithCoinType(dbtx, 0, 0,
+			tip, nil, cointype.CoinTypeVAR)
+		detail, err := src.SelectInputs(0, cointype.Zero())
+		if err != nil {
+			return err
+		}
+		for _, in := range detail.Inputs {
+			unspent[in.PreviousOutPoint] = true
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return unspent
 }
 
 // testWalletOutput records a tx paying 1e8 to the wallet and returns that
