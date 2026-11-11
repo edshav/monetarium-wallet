@@ -15,6 +15,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -506,22 +507,35 @@ func TestVSPUpdateMaxFeeRaisesRunningJobCap(t *testing.T) {
 	})
 	ticket := testVSPTicket(ctx, t, c, 1)
 	feeAddr = ticket.votingAddr.String()
-	fp := &vspFeePayment{
-		client: c,
-		ctx:    ctx,
-		ticket: ticket,
-		policy: c.policy,
-		params: c.wallet.chainParams,
-	}
 
-	if err := fp.receiveFeeAddress(); err == nil {
-		t.Fatal("a quote above MaxFee was accepted")
+	// Process reuses this job, whose scheduled attempt is stopped so that it
+	// cannot run during the test.
+	fp := c.feePayment(ctx, ticket, false)
+	fp.stop()
+
+	// The refusal is checked by its message.
+	err := c.Process(ctx, ticket, nil)
+	if err == nil || !strings.Contains(err.Error(), "server fee amount too high") {
+		t.Fatalf("Process: want the fee cap refusal, got %v", err)
+	}
+	info, err := ticket.VSPTicketInfo(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := udb.FeeStatus(info.FeeTxStatus); got != udb.VSPFeeProcessErrored {
+		t.Fatalf("fee status after the refusal = %v, want errored", got)
+	}
+	fp.mu.Lock()
+	refused := fp.fee
+	fp.mu.Unlock()
+	if refused != 0 {
+		t.Fatalf("the refused quote %v was kept", refused)
 	}
 
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		c.UpdateMaxFee(3e8)
+		c.UpdateMaxFee(quote) // the cap equal to the quote accepts it
 	}()
 	_ = fp.receiveFeeAddress() // races UpdateMaxFee; either outcome is fine
 	<-done
@@ -533,7 +547,7 @@ func TestVSPUpdateMaxFeeRaisesRunningJobCap(t *testing.T) {
 		t.Fatalf("fee = %v, want %v", fp.fee, quote)
 	}
 	c.UpdateMaxFee(1)
-	if got := c.maxFee(); got != 3e8 {
+	if got := c.maxFee(); got != quote {
 		t.Fatalf("UpdateMaxFee lowered the cap to %v", got)
 	}
 }
@@ -550,9 +564,26 @@ func TestVSPFeeJobUsesLifetime(t *testing.T) {
 	c.SetLifetime(life)
 	c.SetLifetime(nil)
 
-	fp := c.feePayment(ctx, testVSPTicket(ctx, t, c, 1), false)
+	first := testVSPTicket(ctx, t, c, 1)
+	fp := c.feePayment(ctx, first, false)
+	fp.stop()
 	if fp.ctx != life {
 		t.Fatalf("fee job context is %v, want the lifetime context", fp.ctx)
+	}
+	// Ending the lifetime ends the job's VSP requests but keeps the job, so
+	// Process on this client reuses it and fails too.
+	cancel()
+	if err := fp.receiveFeeAddress(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("VSP request after the lifetime ended: want context.Canceled, got %v", err)
+	}
+	if err := c.Process(ctx, first, nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Process after the lifetime ended: want context.Canceled, got %v", err)
+	}
+	c.mu.Lock()
+	kept := c.jobs[*first.Hash()] == fp
+	c.mu.Unlock()
+	if !kept {
+		t.Fatal("ending the lifetime removed the job")
 	}
 
 	// SetLifetime may run while a job starts (checked by -race).
@@ -603,10 +634,24 @@ func TestVSPTicketLookups(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Two tickets, each with its own fee hash and status, the first a
+	// non-zero one.
 	ticket := testVSPTicket(ctx, t, c, 1)
 	feeHash := chainhash.Hash{0xfe}
-	if err := ticket.UpdateFeeStarted(ctx, feeHash, c.URL, c.PubKey); err != nil {
+	if err := ticket.UpdateFeePaid(ctx, feeHash, c.URL, c.PubKey); err != nil {
 		t.Fatal(err)
+	}
+	other := testVSPTicket(ctx, t, c, 2)
+	if err := other.UpdateFeeStarted(ctx, chainhash.Hash{0xfd}, c.URL, c.PubKey); err != nil {
+		t.Fatal(err)
+	}
+	type fee struct {
+		hash   chainhash.Hash
+		status udb.FeeStatus
+	}
+	want := map[chainhash.Hash]fee{
+		*ticket.Hash(): {feeHash, udb.VSPFeeProcessPaid},
+		*other.Hash():  {chainhash.Hash{0xfd}, udb.VSPFeeProcessStarted},
 	}
 
 	rec, err := w.VSPTicket(ctx, ticket.Hash())
@@ -614,7 +659,7 @@ func TestVSPTicketLookups(t *testing.T) {
 		t.Fatal(err)
 	}
 	if rec.FeeHash != feeHash || rec.Host != c.URL || !bytes.Equal(rec.PubKey, c.PubKey) ||
-		rec.FeeTxStatus != uint32(udb.VSPFeeProcessStarted) {
+		rec.FeeTxStatus != uint32(udb.VSPFeeProcessPaid) {
 		t.Fatalf("VSPTicket = %+v", rec)
 	}
 	// The record is the caller's: a slice into the read-only database map
@@ -626,20 +671,24 @@ func TestVSPTicketLookups(t *testing.T) {
 	timer := time.AfterFunc(time.Minute, func() {
 		panic("ForEachVSPTicket callback deadlocked on the database")
 	})
-	seen := 0
+	seen := make(map[chainhash.Hash]bool)
 	err = w.ForEachVSPTicket(ctx, func(h chainhash.Hash, rec *udb.VSPTicket) error {
-		seen++
-		if h != *ticket.Hash() || rec.FeeHash != feeHash {
+		wantFee, ok := want[h]
+		if !ok || seen[h] || rec.FeeHash != wantFee.hash || udb.FeeStatus(rec.FeeTxStatus) != wantFee.status {
 			t.Errorf("ForEachVSPTicket visited %v with %+v", h, rec)
 		}
+		seen[h] = true
 		if _, err := w.TxUnpublished(ctx, &h); err != nil {
 			return err
+		}
+		if len(seen) > 1 {
+			return nil
 		}
 		return growDB(ctx, w, "testgrow")
 	})
 	timer.Stop()
-	if err != nil || seen != 1 {
-		t.Fatalf("ForEachVSPTicket: err %v, visited %d, want 1", err, seen)
+	if err != nil || len(seen) != len(want) {
+		t.Fatalf("ForEachVSPTicket: err %v, visited %d, want %d", err, len(seen), len(want))
 	}
 
 	for _, published := range []bool{false, true} {
