@@ -150,11 +150,14 @@ func failVSPWrites(c *VSPClient) {
 // expired, the ticket is no longer recorded as paid with the abandoned tx.
 func TestVSPExpiredFeeMarksErrored(t *testing.T) {
 	for _, tc := range []struct {
-		name      string
-		published bool // the job's fee tx is one the wallet published
+		name       string
+		published  bool // the job's fee tx is one the wallet published
+		failWrites bool
 	}{
 		{name: "unpublished fee tx"},
 		{name: "published fee tx", published: true},
+		// The VSP's error is returned, not the failed write's.
+		{name: "status write fails", failWrites: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -166,6 +169,9 @@ func TestVSPExpiredFeeMarksErrored(t *testing.T) {
 			insertUnmined(ctx, t, c.wallet, feeTx, !tc.published)
 			if err := ticket.UpdateFeePaid(ctx, feeTx.TxHash(), c.URL, c.PubKey); err != nil {
 				t.Fatal(err)
+			}
+			if tc.failWrites {
+				failVSPWrites(c)
 			}
 			fp := &vspFeePayment{
 				client:  c,
@@ -185,8 +191,12 @@ func TestVSPExpiredFeeMarksErrored(t *testing.T) {
 				t.Fatalf("reconcilePayment: want ErrFeeExpired, got %v", err)
 			}
 			fp.stop()
-			if got := feeStatus(ctx, t, ticket); got != udb.VSPFeeProcessErrored {
-				t.Fatalf("fee status after an expired fee = %v, want errored", got)
+			want := udb.VSPFeeProcessErrored
+			if tc.failWrites {
+				want = udb.VSPFeeProcessPaid
+			}
+			if got := feeStatus(ctx, t, ticket); got != want {
+				t.Fatalf("fee status after an expired fee = %v, want %v", got, want)
 			}
 			fp.mu.Lock()
 			feeHash := fp.feeHash
@@ -203,9 +213,67 @@ func TestVSPExpiredFeeMarksErrored(t *testing.T) {
 	}
 }
 
+// walletFundedFeeTx returns an unsigned fee tx with one input, an output the
+// wallet holds, for makeFeeTx to finish.
+func walletFundedFeeTx(ctx context.Context, t *testing.T, w *Wallet) *wire.MsgTx {
+	t.Helper()
+	addr, err := w.NewInternalAddress(ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ver, script := addr.(Address).PaymentScript()
+	fund := wire.NewMsgTx()
+	fund.AddTxIn(wire.NewTxIn(&wire.OutPoint{Hash: chainhash.Hash{2}}, 1e8, nil))
+	fund.AddTxOut(&wire.TxOut{Value: 1e8, Version: ver, PkScript: script})
+	if err := w.AddTransaction(ctx, fund, nil); err != nil {
+		t.Fatal(err)
+	}
+	feeTx := wire.NewMsgTx()
+	feeTx.AddTxIn(wire.NewTxIn(&wire.OutPoint{Hash: fund.TxHash()}, 1e8, nil))
+	return feeTx
+}
+
+// TestVSPRejectedNewFeeTxIsAbandoned checks that a fee tx reconcilePayment
+// makes and the VSP then rejects in the same attempt is removed from the
+// wallet, so its inputs can be spent again.
+func TestVSPRejectedNewFeeTxIsAbandoned(t *testing.T) {
+	ctx := context.Background()
+	c := testVSPClient(ctx, t, func(string, []byte) (int, any) {
+		return apiError(types.ErrInvalidFeeTx)
+	})
+	w := c.wallet
+	ticket := testVSPTicket(ctx, t, c, 1)
+	feeTx := walletFundedFeeTx(ctx, t, w)
+	fp := &vspFeePayment{
+		client:  c,
+		ctx:     ctx,
+		ticket:  ticket,
+		policy:  c.policy,
+		params:  w.chainParams,
+		fee:     1e7,
+		feeAddr: ticket.votingAddr,
+		feeTx:   feeTx,
+	}
+	c.jobs[*ticket.Hash()] = fp
+
+	var apiErr types.ErrorResponse
+	if err := fp.reconcilePayment(); !errors.As(err, &apiErr) || apiErr.Code != types.ErrInvalidFeeTx {
+		t.Fatalf("reconcilePayment: want ErrInvalidFeeTx, got %v", err)
+	}
+	fp.stop()
+	if len(feeTx.TxOut) == 0 {
+		t.Fatal("test setup: the fee tx was not made")
+	}
+	feeHash := feeTx.TxHash()
+	if _, _, err := w.TxBlock(ctx, &feeHash); !errors.Is(err, errors.NotExist) {
+		t.Fatalf("the rejected fee tx is still in the wallet (err %v)", err)
+	}
+}
+
 // TestVSPRejectedFeeTxIsAbandoned checks that a fee tx the VSP rejects is
 // removed from the wallet so its inputs can be spent again, and that a new fee
 // is requested on the retry, even when the errored status cannot be written.
+// When it can, the ticket is recorded as errored.
 func TestVSPRejectedFeeTxIsAbandoned(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
@@ -229,6 +297,9 @@ func TestVSPRejectedFeeTxIsAbandoned(t *testing.T) {
 			feeTx := signedFeeTx(0xcd)
 			insertUnmined(ctx, t, c.wallet, feeTx, !tc.published)
 			feeHash := feeTx.TxHash()
+			if err := ticket.UpdateFeeStarted(ctx, feeHash, c.URL, c.PubKey); err != nil {
+				t.Fatal(err)
+			}
 			if tc.failWrites {
 				failVSPWrites(c)
 			}
@@ -263,6 +334,13 @@ func TestVSPRejectedFeeTxIsAbandoned(t *testing.T) {
 			fp.mu.Unlock()
 			if fee != 0 {
 				t.Fatalf("the retry would pay the rejected fee %v again", fee)
+			}
+			want := udb.VSPFeeProcessErrored
+			if tc.failWrites {
+				want = udb.VSPFeeProcessStarted
+			}
+			if got := feeStatus(ctx, t, ticket); got != want {
+				t.Fatalf("fee status after the VSP rejected the fee tx = %v, want %v", got, want)
 			}
 		})
 	}
@@ -316,22 +394,8 @@ func TestVSPFailedPaidWriteAbandonsFeeTx(t *testing.T) {
 	})
 	w := c.wallet
 	ticket := testVSPTicket(ctx, t, c, 1)
-
-	// Fund the fee tx from an output of the wallet.
-	addr, err := w.NewInternalAddress(ctx, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ver, script := addr.(Address).PaymentScript()
-	fund := wire.NewMsgTx()
-	fund.AddTxIn(wire.NewTxIn(&wire.OutPoint{Hash: chainhash.Hash{2}}, 1e8, nil))
-	fund.AddTxOut(&wire.TxOut{Value: 1e8, Version: ver, PkScript: script})
-	if err := w.AddTransaction(ctx, fund, nil); err != nil {
-		t.Fatal(err)
-	}
+	feeTx := walletFundedFeeTx(ctx, t, w)
 	failVSPWrites(c)
-	feeTx := wire.NewMsgTx()
-	feeTx.AddTxIn(wire.NewTxIn(&wire.OutPoint{Hash: fund.TxHash()}, 1e8, nil))
 	fp := &vspFeePayment{
 		client:  c,
 		ctx:     ctx,
