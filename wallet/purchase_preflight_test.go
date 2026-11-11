@@ -333,20 +333,41 @@ func TestPurchaseTicketsAllVARInTickets(t *testing.T) {
 func TestPurchaseTicketsPreflightBalance(t *testing.T) {
 	const amt = 2e8
 	tests := []struct {
-		name    string
-		mined   bool
-		expiry  uint32 // fund tx expiry
-		change  bool   // pay an internal address
-		other   bool   // purchase from a second, empty account
-		minConf int32
+		name        string
+		mined       bool
+		expiry      uint32 // fund tx expiry
+		coinbase    bool   // fund tx is a coinbase
+		unpublished bool   // fund tx is recorded but not published
+		change      bool   // pay an internal address
+		other       bool   // purchase from a second, empty account
+		minConf     int32
 		// Spendable at minConf as each balance reads it, checked in setup.
 		wantAcct, wantByCoin dcrutil.Amount
 		wantPreflight        bool
 	}{{
-		// AccountBalance counts a young output with expiry as immature,
-		// AccountBalanceByCoinType as spendable.
+		// AccountBalance counts a young output with expiry as immature.
+		// AccountBalanceByCoinType counts it as spendable until it
+		// applies the same rule (a separate change); then the case skips.
 		name: "mined output with expiry, minconf 1", mined: true, expiry: 1000,
 		minConf: 1, wantAcct: 0, wantByCoin: amt,
+	}, {
+		// The same output at minconf 0: the node rejects the spend
+		// (ErrExpiryTxSpentEarly), so the pre-flight refuses.
+		name: "mined output with expiry, minconf 0", mined: true, expiry: 1000,
+		minConf: 0, wantAcct: 0, wantByCoin: amt, wantPreflight: true,
+	}, {
+		// A published unmined output with an expiry counts as spendable
+		// at minconf 0, though the node rejects its spend until it is
+		// mined and mature: the check lets the purchase through.
+		name: "unmined output with expiry, minconf 0", expiry: 1000,
+		minConf: 0, wantAcct: amt, wantByCoin: 0,
+	}, {
+		// Selection skips outputs of unpublished txs at any minconf.
+		name: "unpublished tx, minconf 0", unpublished: true,
+		minConf: 0, wantAcct: 0, wantByCoin: 0, wantPreflight: true,
+	}, {
+		name: "immature coinbase, minconf 0", mined: true, coinbase: true,
+		minConf: 0, wantAcct: 0, wantByCoin: 0, wantPreflight: true,
 	}, {
 		// AccountBalanceByCoinType never counts unmined credits.
 		name: "unmined change, minconf 0, no VSP", change: true,
@@ -384,7 +405,11 @@ func TestPurchaseTicketsPreflightBalance(t *testing.T) {
 			}
 			fund := wire.NewMsgTx()
 			fund.Expiry = tc.expiry
-			fund.AddTxIn(wire.NewTxIn(&wire.OutPoint{Hash: chainhash.Hash{0xfd}}, amt, nil))
+			prevOut := wire.OutPoint{Hash: chainhash.Hash{0xfd}}
+			if tc.coinbase {
+				prevOut = wire.OutPoint{Index: wire.MaxPrevOutIndex}
+			}
+			fund.AddTxIn(wire.NewTxIn(&prevOut, amt, nil))
 			ver, script := addr.(Address).PaymentScript()
 			fund.AddTxOut(&wire.TxOut{Value: amt, Version: ver, PkScript: script})
 			var blockHash *chainhash.Hash
@@ -393,6 +418,12 @@ func TestPurchaseTicketsPreflightBalance(t *testing.T) {
 			}
 			if err := w.AddTransaction(ctx, fund, blockHash); err != nil {
 				t.Fatal(err)
+			}
+			if tc.unpublished {
+				fundHash := fund.TxHash()
+				if err := w.SetPublished(ctx, &fundHash, false); err != nil {
+					t.Fatal(err)
+				}
 			}
 
 			var account uint32
@@ -410,12 +441,14 @@ func TestPurchaseTicketsPreflightBalance(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if tc.wantByCoin > 0 && coinBal.Spendable == 0 {
-				// Selection-side maturity for expiry outputs (a separate
-				// change) makes both readings agree; nothing left to pin.
+			// Selection-side maturity for expiry outputs (a separate
+			// change) makes both readings agree.  A refusal is still
+			// pinned; a pass has nothing left to pin.
+			agree := tc.wantByCoin > 0 && coinBal.Spendable == 0
+			if agree && !tc.wantPreflight {
 				t.Skip("AccountBalanceByCoinType already counts this output as immature")
 			}
-			if bal.Spendable != tc.wantAcct || coinBal.Spendable != tc.wantByCoin {
+			if bal.Spendable != tc.wantAcct || (!agree && coinBal.Spendable != tc.wantByCoin) {
 				t.Fatalf("test setup: Spendable %v (AccountBalance), %v (AccountBalanceByCoinType), want %v, %v",
 					bal.Spendable, coinBal.Spendable, tc.wantAcct, tc.wantByCoin)
 			}
