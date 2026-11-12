@@ -1941,9 +1941,12 @@ func (s *Syncer) peerStartup(ctx context.Context, rp *p2p.RemotePeer) error {
 	}
 	if len(unminedTxs) > 0 {
 		err = pushTransactions(ctx, rp, unminedTxs)
-		if err != nil {
+		switch {
+		case errors.Is(err, context.Canceled):
+			// Shutdown; the caller logs it.
+		case err != nil:
 			// TODO: Transactions should be removed if this is a double spend.
-			log.Errorf("Failed to resent one or more unmined transactions: %v", err)
+			log.Warnf("Failed to resend unmined transactions to %v: %v", rp, err)
 		}
 	}
 
