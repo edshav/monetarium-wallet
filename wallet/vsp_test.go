@@ -452,8 +452,25 @@ func TestVSPFeeChangeSpendableOnceBroadcast(t *testing.T) {
 				feeHash: feeHash,
 			}
 			c.jobs[*ticket.Hash()] = fp // stopped on cleanup
+			next := txNotifications(t, w)
 			if err := fp.reconcilePayment(); err != nil {
 				t.Fatal(err)
+			}
+
+			// Only the broadcast of the wallet's fee tx notifies it, once;
+			// the sentinel comes next.
+			sentinel := walletPayment(ctx, t, w, cointype.CoinTypeVAR)(3)
+			if err := w.AddTransaction(ctx, sentinel, nil); err != nil {
+				t.Fatal(err)
+			}
+			want := []chainhash.Hash{sentinel.TxHash()}
+			if tc.wantSpend {
+				want = []chainhash.Hash{feeHash, sentinel.TxHash()}
+			}
+			for _, h := range want {
+				if got := next(); len(got) != 1 || got[0] != h {
+					t.Fatalf("notified %v, want %v", got, h)
+				}
 			}
 
 			// Spend everything the wallet has at minconf 0.
