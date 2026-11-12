@@ -14,6 +14,8 @@ import (
 	"github.com/monetarium/monetarium-node/chaincfg"
 	"github.com/monetarium/monetarium-node/hdkeychain"
 	"github.com/monetarium/monetarium-node/txscript/stdaddr"
+	"github.com/monetarium/monetarium-node/wire"
+	"github.com/monetarium/monetarium-wallet/errors"
 	"github.com/monetarium/monetarium-wallet/wallet/walletdb"
 )
 
@@ -451,9 +453,23 @@ func TestCurrentAddressAndPersist(t *testing.T) {
 	current(4)
 }
 
+// loadedAddrsNetwork records the addresses passed to LoadTxFilter.
+type loadedAddrsNetwork struct {
+	mockNetwork
+	loaded map[string]bool
+}
+
+func (n *loadedAddrsNetwork) LoadTxFilter(ctx context.Context, reload bool, addrs []stdaddr.Address, outpoints []wire.OutPoint) error {
+	for _, addr := range addrs {
+		n.loaded[addr.String()] = true
+	}
+	return nil
+}
+
 // TestCurrentAddressAndPersistGapLimit checks that, with the gap limit's
 // worth of unused addresses already returned, getaccountaddress returns none of
-// them and leaves the cursor every caller shares where it was.
+// them, watches the one it returns and leaves the cursor every caller shares
+// where it was.
 func TestCurrentAddressAndPersistGapLimit(t *testing.T) {
 	ctx := context.Background()
 	cfg := basicWalletConfig
@@ -468,6 +484,8 @@ func TestCurrentAddressAndPersistGapLimit(t *testing.T) {
 		}
 		returned[addr.String()] = true
 	}
+	net := &loadedAddrsNetwork{loaded: make(map[string]bool)}
+	w.SetNetworkBackend(net)
 	addr, err := w.CurrentAddressAndPersist(ctx, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -475,12 +493,49 @@ func TestCurrentAddressAndPersistGapLimit(t *testing.T) {
 	if returned[addr.String()] {
 		t.Fatalf("getaccountaddress returned %v, already returned by getnewaddress", addr)
 	}
+	// Past the gap limit nothing else watches it, so a payment to it would go unseen.
+	if !net.loaded[addr.String()] {
+		t.Fatalf("getaccountaddress returned %v past the gap limit without watching it", addr)
+	}
 	ext, _, err := w.BIP0044BranchNextIndexes(ctx, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if ext != cfg.GapLimit+1 {
 		t.Fatalf("next external index %d, want %d", ext, cfg.GapLimit+1)
+	}
+
+	// A later one, inside the batch watched with the first, is watched too.
+	if _, err := w.NewExternalAddress(ctx, 0, WithGapPolicyIgnore()); err != nil {
+		t.Fatal(err)
+	}
+	addr, err = w.CurrentAddressAndPersist(ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !net.loaded[addr.String()] {
+		t.Fatalf("getaccountaddress returned %v past the gap limit without watching it", addr)
+	}
+
+	// So is the first one of the next batch.
+	for {
+		next, err := w.NewExternalAddress(ctx, 0, WithGapPolicyIgnore())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if next.(*xpubAddress).child >= 2*cfg.GapLimit-1 {
+			break
+		}
+	}
+	addr, err = w.CurrentAddressAndPersist(ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if child := addr.(*xpubAddress).child; child != 2*cfg.GapLimit {
+		t.Fatalf("getaccountaddress returned child %d, want %d", child, 2*cfg.GapLimit)
+	}
+	if !net.loaded[addr.String()] {
+		t.Fatalf("getaccountaddress returned %v in a second batch without watching it", addr)
 	}
 }
 
@@ -527,49 +582,57 @@ func TestCurrentAddressAndPersistConcurrent(t *testing.T) {
 	w, teardown := testWallet(ctx, t, &cfg, nil)
 	defer teardown()
 
-	var mu sync.Mutex
-	current := make(map[string]bool)
-	fresh := make(map[string]bool)
+	// Each goroutine keeps its own results until all are done: a lock
+	// shared between them would order their calls for -race and hide an
+	// unlocked access to the remembered child.
+	const pairs = 2
+	current := make([][]string, pairs)
+	fresh := make([][]string, pairs)
 	var wg sync.WaitGroup
-	for range 2 {
+	for i := range pairs {
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			for range 10 {
+			for range 50 {
 				addr, err := w.CurrentAddressAndPersist(ctx, 0)
 				if err != nil {
 					t.Error(err)
 					return
 				}
-				mu.Lock()
-				current[addr.String()] = true
-				mu.Unlock()
+				current[i] = append(current[i], addr.String())
 			}
 		}()
 		go func() {
 			defer wg.Done()
-			for range 5 {
+			for range 10 {
 				addr, err := w.NewExternalAddress(ctx, 0, WithGapPolicyIgnore())
 				if err != nil {
 					t.Error(err)
 					return
 				}
-				mu.Lock()
-				fresh[addr.String()] = true
-				mu.Unlock()
+				fresh[i] = append(fresh[i], addr.String())
 			}
 		}()
 	}
 	wg.Wait()
-	for addr := range current {
-		if fresh[addr] {
-			t.Errorf("%v returned by both getaccountaddress and getnewaddress", addr)
+	fromNew := make(map[string]bool)
+	for _, addrs := range fresh {
+		for _, addr := range addrs {
+			fromNew[addr] = true
+		}
+	}
+	for _, addrs := range current {
+		for _, addr := range addrs {
+			if fromNew[addr] {
+				t.Errorf("%v returned by both getaccountaddress and getnewaddress", addr)
+			}
 		}
 	}
 }
 
 // TestCurrentAddressAndPersistConcurrentFirstCall checks that concurrent
-// calls on an account with no remembered address all return one address.
+// calls on an account with no remembered address all return one address and
+// use up one index.
 func TestCurrentAddressAndPersistConcurrentFirstCall(t *testing.T) {
 	ctx := context.Background()
 	cfg := basicWalletConfig
@@ -577,35 +640,79 @@ func TestCurrentAddressAndPersistConcurrentFirstCall(t *testing.T) {
 	defer teardown()
 
 	const n = 8
-	addrs := make([]string, n)
-	start := make(chan struct{})
-	var wg sync.WaitGroup
-	for i := range n {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			<-start
-			addr, err := w.CurrentAddressAndPersist(ctx, 0)
-			if err != nil {
-				t.Error(err)
-				return
+	// One round catches calls racing past the check only now and then.
+	for round := range uint32(16) {
+		addrs := make([]string, n)
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for i := range n {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				addr, err := w.CurrentAddressAndPersist(ctx, 0)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				addrs[i] = addr.String()
+			}()
+		}
+		close(start)
+		wg.Wait()
+		for i := 1; i < n; i++ {
+			if addrs[i] != addrs[0] {
+				t.Fatalf("round %d: concurrent calls returned %v and %v", round, addrs[0], addrs[i])
 			}
-			addrs[i] = addr.String()
-		}()
-	}
-	close(start)
-	wg.Wait()
-	for i := 1; i < n; i++ {
-		if addrs[i] != addrs[0] {
-			t.Fatalf("concurrent calls returned %v and %v", addrs[0], addrs[i])
+		}
+		// Only one index was used up.  The new address also clears the
+		// remembered one, so the next round makes first calls again.
+		next, err := w.NewExternalAddress(ctx, 0, WithGapPolicyIgnore())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if child := next.(*xpubAddress).child; child != 2*round+1 {
+			t.Fatalf("round %d: next address is child %d, want %d", round, child, 2*round+1)
 		}
 	}
-	// Only one index was used up.
-	next, err := w.NewExternalAddress(ctx, 0)
+}
+
+// TestCurrentAddressAndPersistUnknownAccount checks that
+// CurrentAddressAndPersist on an account number with no address buffer fails
+// with NotExist.
+func TestCurrentAddressAndPersistUnknownAccount(t *testing.T) {
+	ctx := context.Background()
+	cfg := basicWalletConfig
+	w, teardown := testWallet(ctx, t, &cfg, nil)
+	defer teardown()
+
+	_, err := w.CurrentAddressAndPersist(ctx, 100)
+	if !errors.Is(err, errors.NotExist) {
+		t.Fatalf("got error %v, want NotExist", err)
+	}
+}
+
+// TestCurrentAddressAndPersistVotingAccount checks that getaccountaddress
+// refuses an imported voting account, as getnewaddress does: its addresses are
+// not for normal transactions.
+func TestCurrentAddressAndPersistVotingAccount(t *testing.T) {
+	ctx := context.Background()
+	cfg := basicWalletConfig
+	w, teardown := testWallet(ctx, t, &cfg, nil)
+	defer teardown()
+
+	seed := bytes.Repeat([]byte{0x42}, hdkeychain.RecommendedSeedLen)
+	xpriv, err := hdkeychain.NewMaster(seed, cfg.Params)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if child := next.(*xpubAddress).child; child != 1 {
-		t.Errorf("next address is child %d, want 1", child)
+	acct, err := w.ImportVotingAccount(ctx, xpriv, []byte("voting"), "voting")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = w.CurrentAddressAndPersist(ctx, acct)
+	if !errors.Is(err, errors.Invalid) {
+		t.Fatalf("got error %v, want Invalid", err)
 	}
 }
