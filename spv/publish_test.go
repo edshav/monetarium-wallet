@@ -5,11 +5,15 @@
 package spv
 
 import (
+	"bytes"
 	"context"
 	"net"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/decred/slog"
 	"github.com/monetarium/monetarium-node/addrmgr"
 	"github.com/monetarium/monetarium-node/chaincfg"
 	"github.com/monetarium/monetarium-node/chaincfg/chainhash"
@@ -23,7 +27,9 @@ import (
 // connectRecordingPeer connects to a remote peer that passes on the tx and inv
 // messages it receives and answers getinitstate with an empty initstate.
 // With hangUp it closes the connection on the first ping, which it is then
-// sent, and the returned peer can no longer send.
+// sent, and the returned peer has disconnected: its writer takes one more
+// message, fails to write it and stops, so only its next send succeeds and
+// every later one waits for its context.
 func connectRecordingPeer(t *testing.T, hangUp bool) (*p2p.RemotePeer, <-chan wire.Message) {
 	t.Helper()
 	params := chaincfg.SimNetParams()
@@ -77,19 +83,13 @@ func connectRecordingPeer(t *testing.T, hangUp bool) (*p2p.RemotePeer, <-chan wi
 		t.Fatal(err)
 	}
 	if hangUp {
-		// Once a write fails, the peer's writer stops and every later
-		// send waits for its context.
-		deadline := time.Now().Add(10 * time.Second)
-		for {
-			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-			err := rp.SendMessage(ctx, wire.NewMsgPing(0))
-			cancel()
-			if err != nil {
-				break
-			}
-			if time.Now().After(deadline) {
-				t.Fatal("peer can still send after the remote closed")
-			}
+		if err := rp.SendMessage(ctx, wire.NewMsgPing(0)); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-rp.Done():
+		case <-time.After(10 * time.Second):
+			t.Fatal("peer still connected after the remote closed")
 		}
 	}
 	return rp, received
@@ -183,58 +183,166 @@ func TestPublishTransactionsSurvivesDeadPeers(t *testing.T) {
 	tx := payment(version, script, cointype.CoinTypeVAR, 1)
 	dead := make(map[string]*p2p.RemotePeer)
 	for _, name := range []string{"d1", "d2", "d3"} {
-		dead[name], _ = connectRecordingPeer(t, true)
+		rp, _ := connectRecordingPeer(t, true)
+		// Spend the one send a hung-up peer has left.
+		if err := rp.SendMessage(context.Background(), wire.NewMsgPing(0)); err != nil {
+			t.Fatal(err)
+		}
+		dead[name] = rp
 	}
-	// The dead peers' sends wait for this context.
-	const stall = 2 * time.Second
-	publish := func(s *Syncer) error {
-		ctx, cancel := context.WithTimeout(context.Background(), stall)
-		defer cancel()
-		return s.PublishTransactions(ctx, tx)
-	}
-
+	// The dead peers' sends wait for the context, so with no other peer the
+	// call fails with its error.
 	s := syncer()
 	s.remotes = dead
-	result := make(chan error, 1)
-	go func() { result <- publish(s) }()
-	// Let the publish copy the peer list and start its sends first.
-	time.Sleep(stall / 4)
-	locked := make(chan struct{})
-	go func() {
-		s.remotesMu.Lock()
-		s.remotesMu.Unlock()
-		close(locked)
-	}()
-	select {
-	case <-locked:
-	case <-time.After(stall / 4):
-		t.Fatal("remotesMu held while sends stall")
-	}
-	if err := <-result; !errors.Is(err, context.DeadlineExceeded) {
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	err := s.PublishTransactions(ctx, tx)
+	cancel()
+	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("no peer took the transaction, but PublishTransactions returned %v", err)
 	}
 
-	// The live peer must get the transaction long before the dead peers'
-	// sends give up, whatever the map order puts ahead of it.
+	// With a live peer added, whatever the map order puts ahead of it, the
+	// live peer gets the transaction and remotesMu is free while the dead
+	// peers' sends still wait. The deadline only bounds a failing run: each
+	// round cancels the context once both are seen. The live peer goes in
+	// last, since a small map tends to iterate from the first key inserted.
 	live, received := connectRecordingPeer(t, false)
-	for range 5 {
+	for range 10 {
 		s := syncer()
-		s.remotes = map[string]*p2p.RemotePeer{"live": live}
+		s.remotes = make(map[string]*p2p.RemotePeer)
 		for name, rp := range dead {
 			s.remotes[name] = rp
 		}
-		go func() { result <- publish(s) }()
+		s.remotes["live"] = live
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		result := make(chan error, 1)
+		go func() { result <- s.PublishTransactions(ctx, tx) }()
 		select {
 		case msg := <-received:
 			if got, ok := msg.(*wire.MsgTx); !ok || got.TxHash() != tx.TxHash() {
 				t.Fatalf("live peer received %v, want the transaction", msg.Command())
 			}
-		case <-time.After(stall / 2):
-			t.Fatal("live peer waited for the dead peers")
+		case err := <-result:
+			t.Fatalf("PublishTransactions returned %v before the live peer got the transaction", err)
 		}
+		// The sends have started, and the dead ones end only with ctx.
+		s.remotesMu.Lock()
+		s.remotesMu.Unlock()
+		if ctx.Err() != nil {
+			t.Fatal("remotesMu held until the dead peers' sends gave up")
+		}
+		cancel()
 		if err := <-result; err != nil {
 			t.Fatalf("one peer took the transaction, but PublishTransactions returned %v", err)
 		}
+	}
+}
+
+// TestPublishTransactionsPartialPeer checks that a peer that took the parent
+// but failed to take its child does not count as having taken the
+// transactions, so with no other peer the call fails.
+func TestPublishTransactionsPartialPeer(t *testing.T) {
+	w, version, script, syncer := txInvsWallet(t)
+	txs := parentAndChild(t, w, version, script, cointype.CoinTypeVAR)
+
+	// The partial peer's send of the child waits for the context, so the
+	// call fails with its error.
+	s := syncer()
+	partial, _ := connectRecordingPeer(t, true)
+	s.remotes = map[string]*p2p.RemotePeer{"partial": partial}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	err := s.PublishTransactions(ctx, txs...)
+	cancel()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("the peer took only the parent, but PublishTransactions returned %v", err)
+	}
+
+	// With a live peer added, the call succeeds once the live peer has both
+	// transactions. The deadline only bounds a failing run: the context is
+	// cancelled once they arrive.
+	s = syncer()
+	partial, _ = connectRecordingPeer(t, true)
+	live, received := connectRecordingPeer(t, false)
+	s.remotes = map[string]*p2p.RemotePeer{"partial": partial, "live": live}
+	ctx, cancel = context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() { result <- s.PublishTransactions(ctx, txs...) }()
+	receivedAll(t, live, received, txs)
+	cancel()
+	if err := <-result; err != nil {
+		t.Fatalf("one peer took the transactions, but PublishTransactions returned %v", err)
+	}
+}
+
+// syncedLog collects the spv package's log lines.
+type syncedLog struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (l *syncedLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.Write(p)
+}
+
+func (l *syncedLog) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.String()
+}
+
+// TestPeerStartupLogsFailedResend checks that a resend to a new peer that
+// cannot take it is logged as a warning, and that one cut short by shutdown
+// is left to the caller.
+func TestPeerStartupLogsFailedResend(t *testing.T) {
+	const resendFailed = "[WRN] SYNC: Failed to resend unmined transactions"
+	prev := log
+	t.Cleanup(func() { UseLogger(prev) })
+	w, version, script, syncer := txInvsWallet(t)
+	parentAndChild(t, w, version, script, cointype.CoinTypeVAR)
+
+	// startup runs peerStartup until it gets past its wait for the
+	// initial sync, which it picks at random against a peer or context
+	// that is already done, and returns what it logged. A hung-up peer
+	// has no writer left, so every send of the resend ends with ctx.
+	startup := func(ctx context.Context, hangUp bool) string {
+		t.Helper()
+		for range 50 {
+			out := new(syncedLog)
+			logger := slog.NewBackend(out).Logger("SYNC")
+			logger.SetLevel(slog.LevelTrace)
+			UseLogger(logger)
+			s := syncer()
+			s.initialSyncDone = make(chan struct{})
+			close(s.initialSyncDone)
+			rp, _ := connectRecordingPeer(t, hangUp)
+			if hangUp {
+				// Spend the one send a hung-up peer has left.
+				if err := rp.SendMessage(context.Background(), wire.NewMsgPing(0)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			_ = s.peerStartup(ctx, rp)
+			if strings.Contains(out.String(), "Failed to get init state") {
+				return out.String()
+			}
+		}
+		t.Fatal("peerStartup never got past its wait for the initial sync")
+		return ""
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if out := startup(ctx, true); !strings.Contains(out, resendFailed) {
+		t.Fatalf("a failed resend logged:\n%s\nwant a line with %q", out, resendFailed)
+	}
+
+	ctx, cancel = context.WithCancel(context.Background())
+	cancel()
+	if out := startup(ctx, true); strings.Contains(out, "unmined transactions") {
+		t.Fatalf("a resend cut short by shutdown logged:\n%s", out)
 	}
 }
 
