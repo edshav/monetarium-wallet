@@ -2855,8 +2855,9 @@ func (w *Wallet) CurrentAddressAndPersist(ctx context.Context, account uint32) (
 
 	// Otherwise hand out a new address, which syncs it to the address index
 	// and records it returned.  As before, it may pass the gap limit: the
-	// ignore policy then watches it, where wrapping would reset the cursor
-	// that every caller shares.
+	// ignore policy then watches addresses past it in batches of the gap
+	// limit (see nextAddress), where wrapping would reset the cursor that
+	// every caller shares.
 	addr, err := w.NewExternalAddress(ctx, account, WithGapPolicyIgnore())
 	if err != nil {
 		return nil, errors.E(op, err)
