@@ -464,7 +464,8 @@ func (fp *vspFeePayment) reconcilePayment() error {
 		switch apiErr.Code {
 		case types.ErrFeeAlreadyReceived:
 			// The VSP may still be holding the fee tx unbroadcast, so it
-			// stays unpublished until confirmPayment sees it broadcast.
+			// stays unpublished until confirmPayment sees it broadcast or,
+			// in SPV mode, a peer relays it.
 			err = nil
 		case types.ErrInvalidFeeTx, types.ErrCannotBroadcastFee:
 			err := fp.ticket.UpdateFeeErrored(ctx, fp.client.URL, fp.client.PubKey)
