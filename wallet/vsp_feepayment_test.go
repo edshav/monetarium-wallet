@@ -116,15 +116,15 @@ func TestVSPProcessDropsCallerFeeTxOnFailure(t *testing.T) {
 	}
 }
 
-// recordingNetwork is a mockNetwork that records the txs it publishes and
+// publishRecordingNetwork is a mockNetwork that records the txs it publishes and
 // passes each to onPublish, if set.
-type recordingNetwork struct {
+type publishRecordingNetwork struct {
 	mockNetwork
 	published []*wire.MsgTx
 	onPublish func(*wire.MsgTx)
 }
 
-func (n *recordingNetwork) PublishTransactions(_ context.Context, txs ...*wire.MsgTx) error {
+func (n *publishRecordingNetwork) PublishTransactions(_ context.Context, txs ...*wire.MsgTx) error {
 	for _, tx := range txs {
 		n.published = append(n.published, tx)
 		if n.onPublish != nil {
@@ -147,7 +147,7 @@ func vspInfoOr(reply func(path string, body []byte) (int, any)) func(string, []b
 // purchaseWithVSP funds the client's wallet with two outputs per ticket, one
 // for its fee and one for its price, mined in block one, and buys count
 // tickets through c, publishing over n.
-func purchaseWithVSP(ctx context.Context, t *testing.T, c *VSPClient, n *recordingNetwork, count int) (*PurchaseTicketsResponse, error) {
+func purchaseWithVSP(ctx context.Context, t *testing.T, c *VSPClient, n *publishRecordingNetwork, count int) (*PurchaseTicketsResponse, error) {
 	t.Helper()
 	w := c.wallet
 	w.SetNetworkBackend(n)
@@ -208,7 +208,7 @@ func purchaseWithVSP(ctx context.Context, t *testing.T, c *VSPClient, n *recordi
 
 // checkPurchase checks that resp holds count ticket hashes, that those
 // tickets were published, and that no outputs stay locked.
-func checkPurchase(ctx context.Context, t *testing.T, w *Wallet, n *recordingNetwork, resp *PurchaseTicketsResponse, count int) {
+func checkPurchase(ctx context.Context, t *testing.T, w *Wallet, n *publishRecordingNetwork, resp *PurchaseTicketsResponse, count int) {
 	t.Helper()
 	if resp == nil || len(resp.TicketHashes) != count {
 		t.Fatalf("PurchaseTickets response: got %+v, want %d ticket hashes", resp, count)
@@ -245,7 +245,7 @@ func TestPurchaseTicketsFeeFailureKeepsHashes(t *testing.T) {
 	c := testVSPClient(ctx, t, vspInfoOr(func(string, []byte) (int, any) {
 		return apiError(types.ErrInternalError)
 	}))
-	n := new(recordingNetwork)
+	n := new(publishRecordingNetwork)
 	resp, err := purchaseWithVSP(ctx, t, c, n, 1)
 	if !errors.Is(err, ErrVSPFeeNotPaid) {
 		t.Errorf("PurchaseTickets error: got %v, want ErrVSPFeeNotPaid", err)
@@ -261,7 +261,7 @@ func TestPurchaseTicketsVSPTicketFailureKeepsHashes(t *testing.T) {
 	c := testVSPClient(ctx, t, vspInfoOr(func(string, []byte) (int, any) {
 		return apiError(types.ErrInternalError)
 	}))
-	n := &recordingNetwork{onPublish: func(tx *wire.MsgTx) {
+	n := &publishRecordingNetwork{onPublish: func(tx *wire.MsgTx) {
 		if stake.IsSStx(tx) {
 			c.wallet.Lock()
 		}
@@ -303,7 +303,7 @@ func TestPurchaseTicketsFeePaid(t *testing.T) {
 		t.Fatal(err)
 	}
 	feeAddr = addr.String()
-	n := new(recordingNetwork)
+	n := new(publishRecordingNetwork)
 	resp, err := purchaseWithVSP(ctx, t, c, n, 1)
 	if err != nil {
 		t.Errorf("PurchaseTickets error: %v", err)
@@ -363,7 +363,7 @@ func TestPurchaseTicketsFeeErrorNamesTicket(t *testing.T) {
 		t.Fatal(err)
 	}
 	feeAddr = addr.String()
-	n := new(recordingNetwork)
+	n := new(publishRecordingNetwork)
 	resp, err := purchaseWithVSP(ctx, t, c, n, 2)
 	checkPurchase(ctx, t, c.wallet, n, resp, 2)
 	unpaid, paid := resp.TicketHashes[0].String(), resp.TicketHashes[1].String()
