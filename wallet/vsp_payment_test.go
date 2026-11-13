@@ -507,17 +507,6 @@ func TestVSPProcessFundsFeeTx(t *testing.T) {
 				}
 				return apiError(types.ErrInternalError)
 			})
-			ticket := testVSPTicket(ctx, t, c, 0xf1) // apart from f.fund's inputs
-			// The job feePayment would make for a new ticket, made here
-			// so that no reconcile is scheduled to race Process.
-			c.jobs[*ticket.Hash()] = &vspFeePayment{
-				client: c,
-				ctx:    context.Background(),
-				ticket: ticket,
-				policy: c.policy,
-				params: c.wallet.chainParams,
-			}
-
 			f := &vspPaymentFixture{w: c.wallet, cfg: basicWalletConfig,
 				tip: basicWalletConfig.Params.GenesisBlock.Header}
 			var feeTx *wire.MsgTx
@@ -532,6 +521,19 @@ func TestVSPProcessFundsFeeTx(t *testing.T) {
 			if !tc.unfunded {
 				f.fund(ctx, t, true, 1e8)
 			}
+			// The unmined ticket is added after the funding block: a block
+			// whose stake difficulty differs from its price prunes it.
+			ticket := testVSPTicket(ctx, t, c, 0xf1) // apart from f.fund's inputs
+			// The job feePayment would make for a new ticket, made here
+			// so that no reconcile is scheduled to race Process.
+			c.jobs[*ticket.Hash()] = &vspFeePayment{
+				client: c,
+				ctx:    context.Background(),
+				ticket: ticket,
+				policy: c.policy,
+				params: c.wallet.chainParams,
+			}
+
 			before := lockedOutpoints(ctx, t, c.wallet)
 			unmined := unminedTxs(ctx, t, c.wallet)
 
