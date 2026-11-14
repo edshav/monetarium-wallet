@@ -203,28 +203,47 @@ func (n publishNetwork) PublishTransactions(_ context.Context, txs ...*wire.MsgT
 // ticket, locked while the fees are paid, and the only input of its fee tx.
 // No other UTXO is reserved for the fees.  The fee outputs are locked by the
 // time the split is published: once it is recorded they are spendable
-// credits, and a concurrent spend could select them.
+// credits, and a concurrent spend could select them.  Below stake validation
+// height the estimate is 0, so the split has no fee outputs and the fee
+// payment funds the fee from other outputs.
 func TestPurchaseTicketsFundsVSPFeeFromSplit(t *testing.T) {
 	t.Run("below SVH", func(t *testing.T) {
-		testPurchaseTicketsFundsVSPFeeFromSplit(t, 2, 0, 0, 0)
+		testPurchaseTicketsFundsVSPFeeFromSplit(t, 2, 0, 0, 0, false)
 	})
-	// The dust threshold scales with the relay fee.
+	// The pads and the dust threshold both scale with the relay fee.
 	t.Run("below SVH, relay fee 2e4", func(t *testing.T) {
-		testPurchaseTicketsFundsVSPFeeFromSplit(t, 2, 0, 0, 2e4)
+		testPurchaseTicketsFundsVSPFeeFromSplit(t, 2, 0, 0, 2e4, false)
+	})
+	// At 3 atoms/kB each pad rounds up to the relay fee, so the two pads
+	// are not dust; the 0 estimate alone leaves the fee outputs out.
+	t.Run("below SVH, relay fee 3", func(t *testing.T) {
+		testPurchaseTicketsFundsVSPFeeFromSplit(t, 2, 0, 0, 3, false)
 	})
 	// Past StakeValidationHeight the wallet's estimate is above 0, and at a
 	// ticket price of 0.1 VAR the fee output is not dust.  1 is the
 	// purchaseticket RPC's default minconf.
 	t.Run("past SVH, minconf 1", func(t *testing.T) {
 		svh := uint32(basicWalletConfig.Params.StakeValidationHeight)
-		testPurchaseTicketsFundsVSPFeeFromSplit(t, svh, 1e7, 1, 0)
+		testPurchaseTicketsFundsVSPFeeFromSplit(t, svh, 1e7, 1, 0, true)
+	})
+	// At 1e6 atoms/kB the quote and one pad are dust and the quote and both
+	// pads are not: the output that is tested is the one the split carries.
+	t.Run("past SVH, relay fee 1e6", func(t *testing.T) {
+		svh := uint32(basicWalletConfig.Params.StakeValidationHeight)
+		testPurchaseTicketsFundsVSPFeeFromSplit(t, svh, 1e7, 1, 1e6, true)
+	})
+	// At a ticket price of 0.01 VAR and 1e6 atoms/kB the quote and two pads
+	// are dust, so a quote above 0 still leaves the fee outputs out.
+	t.Run("past SVH, dust at relay fee 1e6", func(t *testing.T) {
+		svh := uint32(basicWalletConfig.Params.StakeValidationHeight)
+		testPurchaseTicketsFundsVSPFeeFromSplit(t, svh, 1e6, 1, 1e6, false)
 	})
 }
 
 // feeOutput is the split's fee output for a quote: the quote and two one-input
-// miner fees, at least the dust threshold.
+// miner fees.
 func (p *purchaseFixture) feeOutput(quote dcrutil.Amount) dcrutil.Amount {
-	return max(quote+2*p.oneInputMinerFee(), txrules.DustThreshold(txsizes.P2PKHPkScriptSize, p.w.RelayFee()))
+	return quote + 2*p.oneInputMinerFee()
 }
 
 // setRelayFee makes relayFee the wallet's VAR relay fee, as a manual fee does:
@@ -250,6 +269,14 @@ func checkNoDust(t *testing.T, tx *wire.MsgTx, relayFee dcrutil.Amount) {
 			t.Errorf("tx %v output %d of %v is dust", tx.TxHash(), i, dcrutil.Amount(out.Value))
 		}
 	}
+}
+
+// pastSVH mines to stake validation height at a ticket price of 0.1 VAR, so
+// the wallet's estimate is above 0 and the split gets fee outputs.
+func (p *purchaseFixture) pastSVH(ctx context.Context, t *testing.T) {
+	t.Helper()
+	p.sbits = 1e7
+	p.mine(ctx, t, uint32(basicWalletConfig.Params.StakeValidationHeight))
 }
 
 // mine extends the main chain with empty blocks up to height in one
@@ -283,10 +310,11 @@ func (p *purchaseFixture) mine(ctx context.Context, t *testing.T, height uint32)
 
 // testPurchaseTicketsFundsVSPFeeFromSplit mines empty blocks, then funds 16
 // outputs in each of the last two blocks up to height, each header carrying
-// ticket price sbits, and buys at minConf, at relayFee unless it is 0.  Above minconf 0 selection starts
-// with a random walk that can come back empty when the account holds only a
-// few outputs; 32 outputs make that negligible.
-func testPurchaseTicketsFundsVSPFeeFromSplit(t *testing.T, height uint32, sbits int64, minConf int32, relayFee dcrutil.Amount) {
+// ticket price sbits, and buys at minConf, at relayFee unless it is 0.  The
+// split has fee outputs when feeOutputs is set.  Above minconf 0 selection
+// starts with a random walk that can come back empty when the account holds
+// only a few outputs; 32 outputs make that negligible.
+func testPurchaseTicketsFundsVSPFeeFromSplit(t *testing.T, height uint32, sbits int64, minConf int32, relayFee dcrutil.Amount, feeOutputs bool) {
 	ctx := context.Background()
 	p := newPurchaseFixture(ctx, t)
 	if relayFee != 0 {
@@ -299,12 +327,14 @@ func testPurchaseTicketsFundsVSPFeeFromSplit(t *testing.T, height uint32, sbits 
 	}
 	_, needed, quote := p.setQuote(ctx, t)
 	pastSVH := int64(height) >= basicWalletConfig.Params.StakeValidationHeight
-	if pastSVH && quote <= 0 {
-		t.Fatalf("wallet's estimate is %v past SVH, want above 0", quote)
+	if pastSVH != (quote > 0) {
+		t.Fatalf("test setup: wallet's estimate is %v at height %d", quote, height)
 	}
 	// A dust fee output would make a real node reject the split.
-	if pastSVH && txrules.IsDustAmount(quote+2*p.oneInputMinerFee(), txsizes.P2PKHPkScriptSize, p.w.RelayFee()) {
-		t.Fatalf("fee output of %v is dust", quote+2*p.oneInputMinerFee())
+	dust := txrules.IsDustAmount(p.feeOutput(quote), txsizes.P2PKHPkScriptSize, p.w.RelayFee())
+	if feeOutputs != (quote > 0 && !dust) {
+		t.Fatalf("test setup: estimate %v, fee output %v dust: %v; want fee outputs: %v",
+			quote, p.feeOutput(quote), dust, feeOutputs)
 	}
 
 	// The locked outpoints at each publish of each tx.
@@ -337,17 +367,35 @@ func testPurchaseTicketsFundsVSPFeeFromSplit(t *testing.T, height uint32, sbits 
 			t.Errorf("ticket output %d is %v, want %v", idx, dcrutil.Amount(out.Value), needed)
 		}
 	}
-	// Below SVH the estimate is 0 and the two pads alone are dust, so the
-	// output is raised to the dust threshold.
+	checkNoDust(t, split, p.w.RelayFee())
+	if !feeOutputs {
+		// No fee outputs: the split is the tickets' outputs and change.
+		if len(feeOuts) != 0 || len(split.TxOut) > count+1 {
+			t.Errorf("split has %d fee outputs and %d outputs, want no fee outputs and at most %d outputs",
+				len(feeOuts), len(split.TxOut), count+1)
+		}
+		// No other output is reserved for the fees either, and none is
+		// left locked once the fee payment returns.
+		for i, locked := range lockedAtPublish[wire.OutPoint{Hash: split.TxHash()}] {
+			if len(locked) != 0 {
+				t.Errorf("locked at publish %d of the split: %v, want nothing", i, locked)
+			}
+		}
+		p.w.lockedOutpointMu.Lock()
+		if len(p.w.lockedOutpoints) != 0 {
+			t.Errorf("locked after the purchase: %v, want nothing", p.w.lockedOutpoints)
+		}
+		p.w.lockedOutpointMu.Unlock()
+		return
+	}
 	want := p.feeOutput(quote)
 	for op := range feeOuts {
 		out := split.TxOut[op.index]
 		if dcrutil.Amount(out.Value) != want {
-			t.Errorf("fee output %d is %v, want the quote and two one-input miner fees, at least the dust threshold: %v",
+			t.Errorf("fee output %d is %v, want the quote and two one-input miner fees: %v",
 				op.index, dcrutil.Amount(out.Value), want)
 		}
 	}
-	checkNoDust(t, split, p.w.RelayFee())
 	if len(feeOuts) != count {
 		t.Fatalf("split has %d fee outputs, want %d", len(feeOuts), count)
 	}
@@ -476,6 +524,7 @@ func TestPurchaseTicketsExtraSplitOutput(t *testing.T) {
 func TestPurchaseTicketsDontSignNoFeeOutputs(t *testing.T) {
 	ctx := context.Background()
 	p := newPurchaseFixture(ctx, t)
+	p.pastSVH(ctx, t)
 	p.fund(ctx, t, true, 1e8)
 	p.fund(ctx, t, true, 1e8)
 	p.setQuote(ctx, t)
@@ -508,6 +557,7 @@ func TestPurchaseTicketsDontSignNoFeeOutputs(t *testing.T) {
 func TestPurchaseTicketsSKAInAccount(t *testing.T) {
 	ctx := context.Background()
 	p := newPurchaseFixture(ctx, t)
+	p.pastSVH(ctx, t)
 	p.fund(ctx, t, true, 1e8)
 	addr, err := p.w.NewInternalAddress(ctx, 0)
 	if err != nil {
@@ -626,6 +676,7 @@ func sortedIndexes(ops map[outpoint]struct{}) []uint32 {
 func TestPurchaseTicketsVSPQuoteAboveFeeOutput(t *testing.T) {
 	ctx := context.Background()
 	p := newPurchaseFixture(ctx, t)
+	p.pastSVH(ctx, t)
 	p.fund(ctx, t, true, 1e8)
 	p.fund(ctx, t, true, 1e8)
 	_, _, quote := p.setQuote(ctx, t)
@@ -680,6 +731,7 @@ func TestPurchaseTicketsVSPQuoteAboveFeeOutput(t *testing.T) {
 func TestPurchaseTicketsVSPQuoteNoTopUp(t *testing.T) {
 	ctx := context.Background()
 	p := newPurchaseFixture(ctx, t)
+	p.pastSVH(ctx, t)
 	p.fund(ctx, t, true, 1e8)
 	_, _, quote := p.setQuote(ctx, t)
 	p.mu.Lock()
@@ -691,8 +743,9 @@ func TestPurchaseTicketsVSPQuoteNoTopUp(t *testing.T) {
 		MinConf:   0,
 		VSPClient: p.c,
 	})
-	// Whether the failed fee's error is returned is a separate change, so
-	// only the response is checked here.
+	// The returned error is ErrVSPFeeNotPaid, which
+	// TestPurchaseTicketsFeeErrorNamesTicket checks, so only the response is
+	// checked here.
 	if resp == nil || len(resp.TicketHashes) != 1 {
 		t.Fatalf("response %v, %v, want 1 ticket hash", resp, err)
 	}
@@ -728,6 +781,7 @@ func TestPurchaseTicketsVSPQuoteNoTopUp(t *testing.T) {
 func TestPurchaseTicketsNewVSPTicketFails(t *testing.T) {
 	ctx := context.Background()
 	p := newPurchaseFixture(ctx, t)
+	p.pastSVH(ctx, t)
 	p.fund(ctx, t, true, 1e8)
 	p.setQuote(ctx, t)
 	n := publishNetwork{publish: func(tx *wire.MsgTx) {
@@ -766,6 +820,7 @@ func TestPurchaseTicketsNewVSPTicketFails(t *testing.T) {
 func TestPurchaseTicketsCountDownFeeOutputs(t *testing.T) {
 	ctx := context.Background()
 	p := newPurchaseFixture(ctx, t)
+	p.pastSVH(ctx, t)
 	_, needed, quote := p.setQuote(ctx, t)
 	perTicket := needed + p.feeOutput(quote)
 	// Two and a half tickets' worth: three do not fit, two do.
@@ -850,6 +905,7 @@ func (n failPublishNetwork) PublishTransactions(_ context.Context, txs ...*wire.
 func TestPurchaseTicketsSplitPublishFails(t *testing.T) {
 	ctx := context.Background()
 	p := newPurchaseFixture(ctx, t)
+	p.pastSVH(ctx, t)
 	p.fund(ctx, t, true, 1e8)
 	p.fund(ctx, t, true, 1e8)
 	p.setQuote(ctx, t)
@@ -894,6 +950,7 @@ func TestPurchaseTicketsSplitPublishFails(t *testing.T) {
 func TestPurchaseTicketsSecondFeeFails(t *testing.T) {
 	ctx := context.Background()
 	p := newPurchaseFixture(ctx, t)
+	p.pastSVH(ctx, t)
 	p.fund(ctx, t, true, 1e8)
 	p.fund(ctx, t, true, 1e8)
 	_, _, quote := p.setQuote(ctx, t)
@@ -906,8 +963,9 @@ func TestPurchaseTicketsSecondFeeFails(t *testing.T) {
 		MinConf:   0,
 		VSPClient: p.c,
 	})
-	// Whether the failed fee's error is returned is a separate change, so
-	// only the response is checked here.
+	// The returned error is ErrVSPFeeNotPaid, which
+	// TestPurchaseTicketsFeeErrorNamesTicket checks, so only the response is
+	// checked here.
 	if resp == nil || len(resp.TicketHashes) != 2 {
 		t.Fatalf("response %v, %v, want 2 ticket hashes", resp, err)
 	}
@@ -952,6 +1010,7 @@ func TestPurchaseTicketsSecondFeeFails(t *testing.T) {
 func TestPurchaseTicketsLocksFeeOutputsBeforeRecord(t *testing.T) {
 	ctx := context.Background()
 	p := newPurchaseFixture(ctx, t)
+	p.pastSVH(ctx, t)
 	p.fund(ctx, t, true, 1e8)
 	p.fund(ctx, t, true, 1e8)
 	p.setQuote(ctx, t)
@@ -1011,26 +1070,32 @@ func TestPurchaseTicketsLocksFeeOutputsBeforeRecord(t *testing.T) {
 }
 
 // TestPurchaseTicketsFeePrepSplitNotDust checks the split PurchaseTickets
-// publishes to give a mixed purchase's VSP fee its own output.  Below SVH the
-// wallet's estimate is 0, so the output is two fees of that split, sized with
-// its change output; that is above the dust threshold, which a node enforces.
-//
-// At 50 atoms/kB the two fees alone are dust, so the output is the dust
-// threshold; a node run with a minimum relay fee that low enforces it.
+// publishes to give a mixed purchase's VSP fee its own output: the wallet's
+// estimate and two fees of that split, sized with its change output, and at
+// least the dust threshold, which a node enforces.  Below SVH the estimate is
+// 0 and the two fees are above the threshold.  At 50 atoms/kB the two fees
+// alone are dust, so the output is the dust threshold; a node run with a
+// minimum relay fee that low enforces it.  Past SVH the estimate is above 0.
 func TestPurchaseTicketsFeePrepSplitNotDust(t *testing.T) {
 	for _, relayFee := range []dcrutil.Amount{0, 50} {
 		t.Run(fmt.Sprintf("relay fee %d", relayFee), func(t *testing.T) {
-			testPurchaseTicketsFeePrepSplitNotDust(t, relayFee)
+			testPurchaseTicketsFeePrepSplitNotDust(t, relayFee, false)
 		})
 	}
+	t.Run("past SVH", func(t *testing.T) {
+		testPurchaseTicketsFeePrepSplitNotDust(t, 0, true)
+	})
 }
 
-func testPurchaseTicketsFeePrepSplitNotDust(t *testing.T, relayFee dcrutil.Amount) {
+func testPurchaseTicketsFeePrepSplitNotDust(t *testing.T, relayFee dcrutil.Amount, pastSVH bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	p := newPurchaseFixture(ctx, t)
 	if relayFee != 0 {
 		p.setRelayFee(t, relayFee)
+	}
+	if pastSVH {
+		p.pastSVH(ctx, t)
 	}
 	p.fund(ctx, t, true, 1e8)
 	p.setQuote(ctx, t)
@@ -1057,14 +1122,25 @@ func testPurchaseTicketsFeePrepSplitNotDust(t *testing.T, relayFee dcrutil.Amoun
 		t.Fatalf("fee split has %d outputs, want the fee output and change", len(prep.TxOut))
 	}
 	checkNoDust(t, prep, p.w.RelayFee())
-	if relayFee == 0 {
-		return
+	// The output is the estimate and two fees of a one-input, one-output
+	// split, or the threshold at the wallet's relay fee where that is more.
+	relay := p.w.RelayFee()
+	price, err := p.w.NextStakeDifficulty(ctx)
+	if err != nil {
+		t.Fatal(err)
 	}
-	// Where the floor applies, the output is the threshold at the wallet's
-	// relay fee, not more.
-	want := txrules.DustThreshold(txsizes.P2PKHPkScriptSize, relayFee)
+	_, height := p.w.MainChainTip(ctx)
+	estimate := txrules.StakePoolTicketFee(price, relay, height, purchaseVSPFeePercent,
+		p.w.chainParams, true, true)
+	if pastSVH != (estimate > 0) {
+		t.Fatalf("test setup: estimate %v at height %d", estimate, height)
+	}
+	size := txsizes.EstimateSerializeSize([]int{txsizes.RedeemP2PKHInputSize},
+		[]*wire.TxOut{{PkScript: make([]byte, txsizes.P2PKHPkScriptSize)}}, txsizes.P2PKHPkScriptSize)
+	want := max(estimate+2*txrules.FeeForSerializeSize(relay, size),
+		txrules.DustThreshold(txsizes.P2PKHPkScriptSize, relay))
 	if a, b := prep.TxOut[0].Value, prep.TxOut[1].Value; min(a, b) != int64(want) {
-		t.Errorf("fee split outputs %d and %d atoms, want the fee output at the dust threshold %d", a, b, int64(want))
+		t.Errorf("fee split outputs %d and %d atoms, want the fee output at %d", a, b, int64(want))
 	}
 }
 
@@ -1106,6 +1182,7 @@ func TestPurchaseTicketsMixedFeeReservation(t *testing.T) {
 func TestPurchaseTicketsSplitRepublishFails(t *testing.T) {
 	ctx := context.Background()
 	p := newPurchaseFixture(ctx, t)
+	p.pastSVH(ctx, t)
 	p.fund(ctx, t, true, 1e8)
 	p.fund(ctx, t, true, 1e8)
 	p.setQuote(ctx, t)
@@ -1146,6 +1223,7 @@ func TestPurchaseTicketsSplitRepublishFails(t *testing.T) {
 func TestPurchaseTicketsTicketFails(t *testing.T) {
 	setup := func(ctx context.Context, t *testing.T) *purchaseFixture {
 		p := newPurchaseFixture(ctx, t)
+		p.pastSVH(ctx, t)
 		p.fund(ctx, t, true, 1e8)
 		p.fund(ctx, t, true, 1e8)
 		p.setQuote(ctx, t)

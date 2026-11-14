@@ -1962,11 +1962,14 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 			// relay fee it was sized with, so CreateVspPayment gives it to
 			// the miner rather than returning it as change.
 			//
-			// Below stake validation height the estimate is 0 and the two
-			// pads alone are dust, which a node rejects in the split, so
-			// the output is at least the dust threshold.
-			if !req.DontSignTx {
-				feePerTicket = max(fee+pad, txrules.DustThreshold(txsizes.P2PKHPkScriptSize, relayFee))
+			// Below stake validation height the estimate is 0, and a dust
+			// fee output would make a node reject the split.  Then the split
+			// gets no fee outputs and the fee is paid as before the split
+			// funded it: the VSP client builds the fee tx from other mined
+			// outputs, at purchase or in a scheduled retry.  fee already
+			// holds one pad, so fee > pad means a quote above 0.
+			if !req.DontSignTx && fee > pad && !txrules.IsDustAmount(fee+pad, txsizes.P2PKHPkScriptSize, relayFee) {
+				feePerTicket = fee + pad
 				log.Infof("VSP fee %v per ticket will be funded from the ticket split", feePerTicket)
 			}
 		} else {
