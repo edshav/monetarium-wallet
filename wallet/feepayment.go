@@ -20,10 +20,12 @@ import (
 	"github.com/monetarium/monetarium-node/txscript/stdaddr"
 	"github.com/monetarium/monetarium-node/wire"
 	"github.com/decred/vspd/types/v3"
+	"github.com/monetarium/monetarium-wallet/wallet/walletdb"
 )
 
 var (
-	errStopped = errors.New("fee processing stopped")
+	errStopped    = errors.New("fee processing stopped")
+	errFeeTooHigh = errors.New("server fee amount too high")
 )
 
 // A random amount of delay (between zero and these jitter constants) is added
@@ -75,6 +77,12 @@ const (
 func (fp *vspFeePayment) removedExpiredOrSpent() bool {
 	var reason string
 	switch {
+	case fp.ticket.Pruned(fp.ctx):
+		// Checked first: the expiry of a ticket the wallet no longer has
+		// cannot be computed.  The VSP record stays: a ticket pruned by
+		// mistake can still be mined, and a later Process call then
+		// resumes its payment.
+		reason = "pruned"
 	case fp.ticket.Expired(fp.ctx):
 		reason = "expired"
 	case fp.ticket.Spent(fp.ctx):
@@ -86,6 +94,38 @@ func (fp *vspFeePayment) removedExpiredOrSpent() bool {
 		return true
 	}
 	return false
+}
+
+// abandonFeeTx removes an unpublished fee tx from the wallet so its inputs can
+// be spent again.  A tx that is not held unpublished is left alone: the hash
+// may come from the VSP, and a tx the network may have must not be forgotten.
+func (fp *vspFeePayment) abandonFeeTx(feeHash chainhash.Hash) {
+	if feeHash == (chainhash.Hash{}) {
+		return
+	}
+	w := fp.client.wallet
+	var unpublished bool
+	err := walletdb.View(fp.ctx, w.db, func(dbtx walletdb.ReadTx) error {
+		recs, err := w.txStore.UnminedTxs(dbtx)
+		for _, rec := range recs {
+			if rec.Hash == feeHash {
+				unpublished = rec.Unpublished
+				break
+			}
+		}
+		return err
+	})
+	if err != nil || !unpublished {
+		fp.client.log.Warnf("Ticket %v: not abandoning fee tx %v: unpublished %v, err %v",
+			fp.ticket, feeHash, unpublished, err)
+		return
+	}
+	err = w.AbandonTransaction(fp.ctx, &feeHash)
+	if err != nil {
+		fp.client.log.Errorf("Ticket %v: abandon fee tx %v: %v", fp.ticket, feeHash, err)
+		return
+	}
+	fp.client.log.Infof("Ticket %v: abandoned fee tx %v", fp.ticket, feeHash)
 }
 
 func (fp *vspFeePayment) remove(reason string) {
@@ -129,7 +169,7 @@ func (c *VSPClient) feePayment(ctx context.Context, ticket *VSPTicket, paidConfi
 
 	fp = &vspFeePayment{
 		client: c,
-		ctx:    context.Background(),
+		ctx:    c.lifetimeCtx(),
 		ticket: ticket,
 		policy: c.policy,
 		params: c.wallet.chainParams,
@@ -148,6 +188,9 @@ func (c *VSPClient) feePayment(ctx context.Context, ticket *VSPTicket, paidConfi
 		return fp
 	}
 
+	// Confirming a fee the VSP holds needs its hash even when the wallet
+	// lacks the fee tx, e.g. one paid before a restore from seed.
+	fp.feeHash = feeHash
 	fee, err := ticket.FeeTx(ctx)
 	if err != nil {
 		// A fee hash is recorded for this ticket, but was not found in
@@ -161,7 +204,6 @@ func (c *VSPClient) feePayment(ctx context.Context, ticket *VSPTicket, paidConfi
 	}
 
 	fp.feeTx = fee
-	fp.feeHash = feeHash
 
 	// If database has been updated to paid or confirmed status, we can forgo
 	// this step.
@@ -278,9 +320,9 @@ func (fp *vspFeePayment) receiveFeeAddress() error {
 	}
 
 	fp.client.log.Infof("VSP requires fee %v", feeAmount)
-	if feeAmount > fp.policy.MaxFee {
-		return fmt.Errorf("server fee amount too high: %v > %v",
-			feeAmount, fp.policy.MaxFee)
+	if maxFee := fp.client.maxFee(); feeAmount > maxFee {
+		return fmt.Errorf("%w: %v > %v", errFeeTooHigh,
+			feeAmount, maxFee)
 	}
 
 	// TODO: validate server timestamp.
@@ -349,6 +391,9 @@ func (fp *vspFeePayment) makeFeeTx(tx *wire.MsgTx) error {
 	feeHash := tx.TxHash()
 	err = fp.ticket.UpdateFeePaid(ctx, feeHash, fp.client.URL, fp.client.PubKey)
 	if err != nil {
+		// CreateVspPayment already added the tx to the wallet.  Abandon
+		// it, or each retry would leave another one holding inputs.
+		fp.abandonFeeTx(feeHash)
 		return err
 	}
 
@@ -401,9 +446,7 @@ func (c *VSPClient) setVoteChoices(ctx context.Context, ticket *VSPTicket,
 func (fp *vspFeePayment) reconcilePayment() error {
 	ctx := fp.ctx
 
-	// stop processing if ticket is expired or spent
-	// TODO: if the ticket is no longer saved by the wallet (tx expired,
-	// double-spent, etc) remove the fee payment.
+	// stop processing if ticket is expired, spent or pruned
 	if fp.removedExpiredOrSpent() {
 		// nothing scheduled
 		return errStopped
@@ -423,21 +466,34 @@ func (fp *vspFeePayment) reconcilePayment() error {
 		if err != nil {
 			var apiErr types.ErrorResponse
 			isAPIErr := errors.As(err, &apiErr)
+			// A concurrent Process call made a fee tx meanwhile: a
+			// made fee tx sets a new hash; one the VSP finds invalid
+			// or cannot broadcast zeroes it.
+			fp.mu.Lock()
+			made := fp.feeHash != startHash && fp.feeHash != (chainhash.Hash{})
+			fp.mu.Unlock()
 			switch {
 			case isAPIErr && apiErr.Code == types.ErrTicketCannotVote:
 				fp.remove("ticket cannot vote")
-			case isAPIErr && apiErr.Code == types.ErrFeeAlreadyReceived,
-				errors.Is(err, errStopped):
+			case isAPIErr && apiErr.Code == types.ErrFeeAlreadyReceived:
+				return fp.recordReceivedFee()
+			case errors.Is(err, errStopped):
 				// Nothing to retry.
+			case errors.Is(err, errFeeTooHigh) && !made:
+				// Retrying every few minutes is not worth it.  Mark the
+				// fee errored so that a later Process call for the
+				// ticket retries it.
+				if markErr := fp.ticket.UpdateFeeErrored(ctx, fp.client.URL, fp.client.PubKey); markErr != nil {
+					fp.client.log.Errorf("Ticket %v: mark fee errored: %v", fp.ticket, markErr)
+				}
+				fp.remove("VSP fee above the configured maximum")
 			default:
 				// Try again, as with failures to submit the payment.
 				// Unless a concurrent Process call made a fee tx
 				// meanwhile, ask the VSP for the fee again, as it may
 				// have received one, and start from a new fee tx: the
 				// failed one may be half built, or hold inputs a ticket
-				// purchase has since unlocked.  A made fee tx sets a
-				// new hash; one the VSP finds invalid or cannot
-				// broadcast zeroes it.
+				// purchase has since unlocked.
 				fp.mu.Lock()
 				if fp.feeHash == startHash || fp.feeHash == (chainhash.Hash{}) {
 					fp.fee = 0
@@ -473,15 +529,19 @@ func (fp *vspFeePayment) reconcilePayment() error {
 			// stays unpublished until confirmPayment sees it broadcast or,
 			// in SPV mode, a peer relays it.
 			err = nil
-		case types.ErrInvalidFeeTx, types.ErrCannotBroadcastFee:
-			err := fp.ticket.UpdateFeeErrored(ctx, fp.client.URL, fp.client.PubKey)
-			if err != nil {
-				return err
+		case types.ErrInvalidFeeTx, types.ErrCannotBroadcastFee,
+			types.ErrCannotBroadcastFeeUnknownOutputs:
+			// A failed write must not skip the abandon and the retry.
+			if markErr := fp.ticket.UpdateFeeErrored(ctx, fp.client.URL, fp.client.PubKey); markErr != nil {
+				fp.client.log.Errorf("Ticket %v: mark fee errored: %v", fp.ticket, markErr)
 			}
-			// Attempt to create a new fee transaction
+			// The VSP will not take this tx.  Abandon it so its inputs
+			// are spendable again, then make a new fee transaction.
+			fp.abandonFeeTx(feeHash)
 			fp.mu.Lock()
 			fp.feeHash = chainhash.Hash{}
 			fp.feeTx = nil
+			fp.fee = 0
 			fp.mu.Unlock()
 			// err not nilled, so reconcile payment is rescheduled.
 		}
@@ -494,6 +554,8 @@ func (fp *vspFeePayment) reconcilePayment() error {
 
 	err = fp.ticket.UpdateFeePaid(ctx, feeHash, fp.client.URL, fp.client.PubKey)
 	if err != nil {
+		// Without a timer the payment would never be retried.
+		fp.schedule("reconcile payment", fp.reconcilePayment)
 		return err
 	}
 
@@ -507,9 +569,49 @@ func (fp *vspFeePayment) reconcilePayment() error {
 	*/
 }
 
+// isFeeAlreadyReceived reports whether err is the VSP saying it already holds
+// a fee tx for the ticket.
+func isFeeAlreadyReceived(err error) bool {
+	var apiErr types.ErrorResponse
+	return errors.As(err, &apiErr) && apiErr.Code == types.ErrFeeAlreadyReceived
+}
+
+// recordReceivedFee records the fee tx the VSP already holds for the ticket as
+// paid, and confirms it.  The VSP answers a fee address request with
+// ErrFeeAlreadyReceived once it holds a fee tx, for example one paid before the
+// wallet was restored from seed.  The job stops using its own fee tx and fee
+// quote, so a retry asks the VSP again; the fee tx itself stays in the wallet.
+func (fp *vspFeePayment) recordReceivedFee() error {
+	ctx := fp.ctx
+
+	fp.mu.Lock()
+	fp.feeTx = nil
+	fp.fee = 0
+	fp.mu.Unlock()
+
+	status, err := fp.client.status(ctx, fp.ticket)
+	var feeHash *chainhash.Hash
+	if err == nil {
+		feeHash, err = chainhash.NewHashFromStr(status.FeeTxHash)
+	}
+	if err == nil && *feeHash == (chainhash.Hash{}) {
+		err = fmt.Errorf("VSP reports a received fee but no fee tx hash")
+	}
+	if err == nil {
+		fp.mu.Lock()
+		fp.feeHash = *feeHash
+		fp.mu.Unlock()
+		err = fp.ticket.UpdateFeePaid(ctx, *feeHash, fp.client.URL, fp.client.PubKey)
+	}
+	if err != nil {
+		fp.schedule("reconcile payment", fp.reconcilePayment)
+		return err
+	}
+	return fp.confirmPayment()
+}
+
 func (fp *vspFeePayment) submitPayment() (err error) {
 	ctx := fp.ctx
-	w := fp.client.wallet
 
 	// stop processing if ticket is expired or spent
 	if fp.removedExpiredOrSpent() {
@@ -559,15 +661,17 @@ func (fp *vspFeePayment) submitPayment() (err error) {
 			// Fee has been expired, so abandon current feetx and forget
 			// the expired fee amount.  The retry then asks the VSP for a
 			// new fee and makes a new fee tx.
-			feeHash := feeTx.TxHash()
-			err := w.AbandonTransaction(ctx, &feeHash)
-			if err != nil {
-				fp.client.log.Errorf("error abandoning expired fee tx %v", err)
-			}
+			fp.abandonFeeTx(feeTx.TxHash())
 			fp.mu.Lock()
 			fp.feeTx = nil
+			fp.feeHash = chainhash.Hash{}
 			fp.fee = 0
 			fp.mu.Unlock()
+			// The abandoned tx must not stay recorded as paid: after a
+			// restart nothing would resume the payment.
+			if markErr := fp.ticket.UpdateFeeErrored(ctx, fp.client.URL, fp.client.PubKey); markErr != nil {
+				fp.client.log.Errorf("Ticket %v: mark fee errored: %v", fp.ticket, markErr)
+			}
 		}
 		return fmt.Errorf("payfee: %w", err)
 	}

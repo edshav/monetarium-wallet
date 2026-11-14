@@ -4854,6 +4854,11 @@ func (s *Server) purchaseTicket(ctx context.Context, icmd any) (any, error) {
 	}
 
 	ticketsResponse, err := w.PurchaseTickets(ctx, n, request)
+	if errors.Is(err, wallet.ErrVSPFeeNotPaid) && ticketsResponse != nil {
+		// The tickets are published and the wallet logged each fee
+		// failure: return their hashes as before.
+		err = nil
+	}
 	if err != nil {
 		return nil, err
 	}

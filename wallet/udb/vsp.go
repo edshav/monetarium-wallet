@@ -5,6 +5,8 @@
 package udb
 
 import (
+	"bytes"
+
 	"github.com/monetarium/monetarium-wallet/errors"
 	"github.com/monetarium/monetarium-wallet/wallet/walletdb"
 	"github.com/monetarium/monetarium-node/chaincfg/chainhash"
@@ -115,6 +117,18 @@ func GetVSPTicket(dbtx walletdb.ReadTx, tickethash chainhash.Hash) (*VSPTicket, 
 		}
 	}
 	return ticket, nil
+}
+
+// ForEachVSPTicket calls f for every VSP-managed ticket. Host/pubkey are
+// left empty — callers that only need FeeHash / FeeTxStatus skip the extra
+// lookups. Iteration stops on the first error from f.
+func ForEachVSPTicket(dbtx walletdb.ReadTx, f func(ticketHash chainhash.Hash, ticket *VSPTicket) error) error {
+	bucket := dbtx.ReadBucket(vspBucketKey)
+	return bucket.ForEach(func(k, v []byte) error {
+		var hash chainhash.Hash
+		_ = hash.SetBytes(k)
+		return f(hash, deserializeVSPTicket(v))
+	})
 }
 
 // GetVSPTicketsByFeeStatus gets all vsp tickets which have
@@ -259,7 +273,8 @@ func deserializeVSPPubKey(serializedPubKey []byte) *VSPPubKey {
 	curPos += 4
 	pubkeyLength := byteOrder.Uint32(serializedPubKey[curPos : curPos+4])
 	curPos += 4
-	VSPPubKey.PubKey = serializedPubKey[curPos : curPos+int(pubkeyLength)]
+	// Copy: the database value is only valid until its transaction ends.
+	VSPPubKey.PubKey = bytes.Clone(serializedPubKey[curPos : curPos+int(pubkeyLength)])
 
 	return VSPPubKey
 }

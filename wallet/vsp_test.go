@@ -5,14 +5,17 @@
 package wallet
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -23,6 +26,7 @@ import (
 	"github.com/monetarium/monetarium-node/cointype"
 	"github.com/monetarium/monetarium-node/txscript/stdaddr"
 	"github.com/monetarium/monetarium-node/wire"
+	werrors "github.com/monetarium/monetarium-wallet/errors"
 	"github.com/monetarium/monetarium-wallet/wallet/udb"
 	"github.com/monetarium/monetarium-wallet/wallet/walletdb"
 )
@@ -173,7 +177,8 @@ func TestVSPExpiredFeeRequestsNewQuote(t *testing.T) {
 
 // TestVSPReconcileRetriesWhenFeeTxFails checks that a failure to create the
 // fee transaction schedules another attempt with a new fee transaction, unless
-// the VSP says the ticket can never vote or already has its fee.
+// the VSP says the ticket can never vote.  When the VSP says it already has the
+// fee but cannot report it, the retry asks again.
 func TestVSPReconcileRetriesWhenFeeTxFails(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -182,7 +187,7 @@ func TestVSPReconcileRetriesWhenFeeTxFails(t *testing.T) {
 	}{
 		{"VSP error", types.ErrInternalError, true},
 		{"ticket cannot vote", types.ErrTicketCannotVote, false},
-		{"fee already received", types.ErrFeeAlreadyReceived, false},
+		{"fee already received", types.ErrFeeAlreadyReceived, true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -496,6 +501,250 @@ func TestVSPFeeChangeSpendableOnceBroadcast(t *testing.T) {
 					spent, tc.wantSpend)
 			}
 		})
+	}
+}
+
+// TestVSPUpdateMaxFeeRaisesRunningJobCap checks that UpdateMaxFee raises the
+// cap that an existing fee job checks the VSP's quote against, never lowers
+// it, and is safe to call while a job reads the cap (run with -race).
+func TestVSPUpdateMaxFeeRaisesRunningJobCap(t *testing.T) {
+	ctx := context.Background()
+	const quote = 2e8 // above testVSPClient's MaxFee of 1e8
+	var feeAddr string
+	c := testVSPClient(ctx, t, func(path string, body []byte) (int, any) {
+		if path != "/api/v3/feeaddress" {
+			return apiError(types.ErrInternalError)
+		}
+		return http.StatusOK, types.FeeAddressResponse{
+			Timestamp:  time.Now().Unix(),
+			FeeAddress: feeAddr,
+			FeeAmount:  quote,
+			Expiration: time.Now().Add(time.Hour).Unix(),
+			Request:    body,
+		}
+	})
+	ticket := testVSPTicket(ctx, t, c, 1)
+	feeAddr = ticket.votingAddr.String()
+
+	// Process reuses this job, whose scheduled attempt is stopped so that it
+	// cannot run during the test.
+	fp := c.feePayment(ctx, ticket, false)
+	fp.stop()
+
+	// The refusal is checked by its message.
+	err := c.Process(ctx, ticket, nil)
+	if err == nil || !strings.Contains(err.Error(), "server fee amount too high") {
+		t.Fatalf("Process: want the fee cap refusal, got %v", err)
+	}
+	info, err := ticket.VSPTicketInfo(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := udb.FeeStatus(info.FeeTxStatus); got != udb.VSPFeeProcessErrored {
+		t.Fatalf("fee status after the refusal = %v, want errored", got)
+	}
+	fp.mu.Lock()
+	refused := fp.fee
+	fp.mu.Unlock()
+	if refused != 0 {
+		t.Fatalf("the refused quote %v was kept", refused)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c.UpdateMaxFee(quote) // the cap equal to the quote accepts it
+	}()
+	_ = fp.receiveFeeAddress() // races UpdateMaxFee; either outcome is fine
+	<-done
+
+	if err := fp.receiveFeeAddress(); err != nil {
+		t.Fatalf("quote within the raised cap: %v", err)
+	}
+	if fp.fee != quote {
+		t.Fatalf("fee = %v, want %v", fp.fee, quote)
+	}
+	c.UpdateMaxFee(1)
+	if got := c.maxFee(); got != quote {
+		t.Fatalf("UpdateMaxFee lowered the cap to %v", got)
+	}
+}
+
+// TestVSPFeeJobUsesLifetime checks that a fee job started after SetLifetime
+// runs under that context, not the caller's request context.
+func TestVSPFeeJobUsesLifetime(t *testing.T) {
+	ctx := context.Background()
+	c := testVSPClient(ctx, t, func(string, []byte) (int, any) {
+		return apiError(types.ErrInternalError)
+	})
+	life, cancel := context.WithCancel(ctx)
+	defer cancel()
+	c.SetLifetime(life)
+	c.SetLifetime(nil)
+
+	first := testVSPTicket(ctx, t, c, 1)
+	fp := c.feePayment(ctx, first, false)
+	fp.stop()
+	if fp.ctx != life {
+		t.Fatalf("fee job context is %v, want the lifetime context", fp.ctx)
+	}
+	// Ending the lifetime ends the job's VSP requests but keeps the job, so
+	// Process on this client reuses it and fails too.
+	cancel()
+	if err := fp.receiveFeeAddress(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("VSP request after the lifetime ended: want context.Canceled, got %v", err)
+	}
+	if err := c.Process(ctx, first, nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Process after the lifetime ended: want context.Canceled, got %v", err)
+	}
+	c.mu.Lock()
+	kept := c.jobs[*first.Hash()] == fp
+	c.mu.Unlock()
+	if !kept {
+		t.Fatal("ending the lifetime removed the job")
+	}
+
+	// SetLifetime may run while a job starts (checked by -race).
+	ticket := testVSPTicket(ctx, t, c, 2)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c.SetLifetime(life)
+	}()
+	_ = c.feePayment(ctx, ticket, false)
+	<-done
+}
+
+// growDB writes enough to make bbolt remap the database file, which waits for
+// every open read transaction to end.
+func growDB(ctx context.Context, w *Wallet, bucket string) error {
+	return walletdb.Update(ctx, w.db, func(dbtx walletdb.ReadWriteTx) error {
+		b, err := dbtx.CreateTopLevelBucket([]byte(bucket))
+		if err != nil {
+			return err
+		}
+		return b.Put([]byte("k"), make([]byte, 16<<20))
+	})
+}
+
+// TestVSPTicketLookups checks VSPTicket, ForEachVSPTicket and TxUnpublished
+// against a ticket whose fee payment has started. A returned record must not
+// alias database memory, and the ForEachVSPTicket callback must be able to use
+// the wallet, including writes that grow the database.
+func TestVSPTicketLookups(t *testing.T) {
+	ctx := context.Background()
+	c := testVSPClient(ctx, t, func(string, []byte) (int, any) {
+		return apiError(types.ErrInternalError)
+	})
+	w := c.wallet
+	// Enough hosts that the pubkey bucket is stored in its own pages rather
+	// than inline, so its values are read straight from the database map.
+	err := walletdb.Update(ctx, w.db, func(dbtx walletdb.ReadWriteTx) error {
+		for i := range 64 {
+			host := []byte(fmt.Sprintf("https://vsp%d.example", i))
+			err := udb.SetVSPPubKey(dbtx, host, &udb.VSPPubKey{ID: 1000 + uint32(i), PubKey: c.PubKey})
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Two tickets, each with its own fee hash and status, the first a
+	// non-zero one.
+	ticket := testVSPTicket(ctx, t, c, 1)
+	feeHash := chainhash.Hash{0xfe}
+	if err := ticket.UpdateFeePaid(ctx, feeHash, c.URL, c.PubKey); err != nil {
+		t.Fatal(err)
+	}
+	other := testVSPTicket(ctx, t, c, 2)
+	if err := other.UpdateFeeStarted(ctx, chainhash.Hash{0xfd}, c.URL, c.PubKey); err != nil {
+		t.Fatal(err)
+	}
+	type fee struct {
+		hash   chainhash.Hash
+		status udb.FeeStatus
+	}
+	want := map[chainhash.Hash]fee{
+		*ticket.Hash(): {feeHash, udb.VSPFeeProcessPaid},
+		*other.Hash():  {chainhash.Hash{0xfd}, udb.VSPFeeProcessStarted},
+	}
+
+	rec, err := w.VSPTicket(ctx, ticket.Hash())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.FeeHash != feeHash || rec.Host != c.URL || !bytes.Equal(rec.PubKey, c.PubKey) ||
+		rec.FeeTxStatus != uint32(udb.VSPFeeProcessPaid) {
+		t.Fatalf("VSPTicket = %+v", rec)
+	}
+	// The record is the caller's: a slice into the read-only database map
+	// would fault here.
+	rec.PubKey[0] ^= 0xff
+
+	// A deadlocked database cannot be closed by the test cleanup either, so
+	// end the process from outside the test goroutine.
+	timer := time.AfterFunc(time.Minute, func() {
+		panic("ForEachVSPTicket callback deadlocked on the database")
+	})
+	seen := make(map[chainhash.Hash]bool)
+	err = w.ForEachVSPTicket(ctx, func(h chainhash.Hash, rec *udb.VSPTicket) error {
+		wantFee, ok := want[h]
+		if !ok || seen[h] || rec.FeeHash != wantFee.hash || udb.FeeStatus(rec.FeeTxStatus) != wantFee.status {
+			t.Errorf("ForEachVSPTicket visited %v with %+v", h, rec)
+		}
+		seen[h] = true
+		if _, err := w.TxUnpublished(ctx, &h); err != nil {
+			return err
+		}
+		if len(seen) > 1 {
+			return nil
+		}
+		return growDB(ctx, w, "testgrow")
+	})
+	timer.Stop()
+	if err != nil || len(seen) != len(want) {
+		t.Fatalf("ForEachVSPTicket: err %v, visited %d, want %d", err, len(seen), len(want))
+	}
+
+	for _, published := range []bool{false, true} {
+		if err := w.SetPublished(ctx, ticket.Hash(), published); err != nil {
+			t.Fatal(err)
+		}
+		unpublished, err := w.TxUnpublished(ctx, ticket.Hash())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if unpublished == published {
+			t.Fatalf("TxUnpublished = %v after SetPublished(%v)", unpublished, published)
+		}
+	}
+	if _, err := w.TxUnpublished(ctx, &chainhash.Hash{0xaa}); !werrors.Is(err, werrors.NotExist) {
+		t.Fatalf("TxUnpublished of an unknown tx: %v, want NotExist", err)
+	}
+	if _, err := w.VSPTicket(ctx, &chainhash.Hash{0xaa}); !werrors.Is(err, werrors.NotExist) {
+		t.Fatalf("VSPTicket of an unknown ticket: %v, want NotExist", err)
+	}
+
+	errStop := errors.New("stop")
+	err = w.ForEachVSPTicket(ctx, func(chainhash.Hash, *udb.VSPTicket) error {
+		return errStop
+	})
+	if !errors.Is(err, errStop) {
+		t.Fatalf("ForEachVSPTicket returned %v, want the callback's error", err)
+	}
+
+	if err := w.db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	err = w.ForEachVSPTicket(ctx, func(chainhash.Hash, *udb.VSPTicket) error {
+		t.Error("callback ran on a closed database")
+		return nil
+	})
+	if err == nil {
+		t.Fatal("ForEachVSPTicket on a closed database returned nil")
 	}
 }
 
