@@ -1854,7 +1854,9 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 	}()
 
 	var vspFeeCredits, ticketCredits [][]Input
-	unlockCredits := true
+	// The fee steps of the first feeStepsRun tickets own their credits; the
+	// deferred unlock frees the rest when the purchase stops early.
+	feeStepsRun := 0
 	total := func(ins []Input) (v int64) {
 		for _, in := range ins {
 			v += in.PrevOut.Value
@@ -1892,13 +1894,11 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 		vspFeeCredits = make([][]Input, 0, req.Count)
 		ticketCredits = make([][]Input, 0, req.Count)
 		defer func() {
-			if unlockCredits {
-				for _, credit := range vspFeeCredits {
-					for _, c := range credit {
-						log.Debugf("unlocked unneeded credit for vsp fee tx: %v",
-							c.OutPoint.String())
-						w.UnlockOutpoint(&c.OutPoint.Hash, c.OutPoint.Index)
-					}
+			for _, credit := range vspFeeCredits[min(feeStepsRun, len(vspFeeCredits)):] {
+				for _, c := range credit {
+					log.Debugf("unlocked unneeded credit for vsp fee tx: %v",
+						c.OutPoint.String())
+					w.UnlockOutpoint(&c.OutPoint.Hash, c.OutPoint.Index)
 				}
 			}
 		}()
@@ -2202,6 +2202,17 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 	}
 
 	var feeErrs []error
+	// stopped returns the error of a purchase that stops before publishing
+	// every ticket, keeping the fee errors of the tickets it published.
+	stopped := func(err error) (*PurchaseTicketsResponse, error) {
+		if len(feeErrs) != 0 {
+			// The fee errors as text only: their kinds must not stand for
+			// the stop's, which sets the RPC error code.
+			err = errors.Errorf("%w; VSP fee not paid for published tickets: %v",
+				err, errors.Join(feeErrs...))
+		}
+		return purchaseTicketsResponse, errors.E(op, err)
+	}
 	for i, ticket := range tickets {
 		// Check for request context cancellation while waiting for
 		// trickle time if this was a mixed buy.
@@ -2214,11 +2225,11 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 				if !timer.Stop() {
 					<-timer.C
 				}
-				return purchaseTicketsResponse, errors.E(op, ctx.Err())
+				return stopped(ctx.Err())
 			case <-timer.C:
 			}
 		} else if err := ctx.Err(); err != nil {
-			return purchaseTicketsResponse, errors.E(op, err)
+			return stopped(err)
 		}
 
 		// Publish transaction
@@ -2232,7 +2243,7 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 			if abandonErr := w.AbandonTransaction(ctx, &hash); abandonErr != nil {
 				log.Errorf("Cannot abandon %v: %v", &hash, abandonErr)
 			}
-			return purchaseTicketsResponse, errors.E(op, err)
+			return stopped(err)
 		}
 		log.Infof("Published ticket purchase %v", ticket.TxHash())
 
@@ -2240,7 +2251,7 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 		if req.VSPClient == nil {
 			continue
 		}
-		unlockCredits = false
+		feeStepsRun = i + 1
 		feeTx := wire.NewMsgTx()
 		for j := range vspFeeCredits[i] {
 			in := &vspFeeCredits[i][j]

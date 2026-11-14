@@ -10,14 +10,18 @@ import (
 	"encoding/json"
 	"maps"
 	"net/http"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/decred/vspd/types/v3"
+	"github.com/monetarium/monetarium-node/blockchain/stake"
 	"github.com/monetarium/monetarium-node/chaincfg/chainhash"
 	"github.com/monetarium/monetarium-node/gcs/blockcf2"
 	"github.com/monetarium/monetarium-node/wire"
+	"github.com/monetarium/monetarium-wallet/errors"
 )
 
 // TestVSPPurchaseTicketsFeeInputs checks, through PurchaseTickets, the inputs
@@ -26,7 +30,10 @@ import (
 // the VSP already holds a fee tx for the ticket, they are unlocked and
 // unspent.  When Process pays with them, the fee txs spend them.  When it
 // pays a fee tx a scheduled attempt made from other outputs, they are
-// unlocked and unspent.
+// unlocked and unspent.  When the purchase stops after the first ticket's
+// fee, because the second ticket fails to publish or the request is
+// cancelled, the second ticket's inputs are unlocked too, and the error
+// keeps the first ticket's fee error.
 func TestVSPPurchaseTicketsFeeInputs(t *testing.T) {
 	const (
 		count  = 2
@@ -49,15 +56,42 @@ func TestVSPPurchaseTicketsFeeInputs(t *testing.T) {
 		// feeFails: the fee is not paid, which the purchase may report as
 		// an error alongside the tickets it published.
 		feeFails bool
+		// tickets is the number asked for; 0 asks for count.
+		tickets int
+		// lowBalance funds 7 outputs of 6e6 instead, so a fee takes one
+		// output: three tickets do not fit, and the low-balance path
+		// buys two, keeping a third fee set beyond the ticket count.
+		lowBalance bool
+		// heldLock: at the second ticket's publish, a concurrent purchase
+		// locks the first ticket's fee inputs, which the fee step already
+		// released; they must stay locked.
+		heldLock bool
+		// lockAtPublish locks the wallet once the first ticket is
+		// published, so its fee address request cannot be signed.
+		lockAtPublish bool
+		// stop ends the purchase after the first ticket's fee: "publish"
+		// fails the second ticket's publish, "cancel" cancels the request
+		// at the first fee address request.
+		stop string
 	}{
 		{name: "Process fails", feeAddrErr: types.ErrInternalError, feeFails: true},
 		{name: "fee tx not signed", lock: true, feeFails: true},
 		{name: "VSP holds the fee", feeAddrErr: types.ErrFeeAlreadyReceived},
 		{name: "fee paid", wantSpent: true},
 		{name: "scheduled attempt's fee tx paid", attempt: true},
+		{name: "second ticket not published", feeAddrErr: types.ErrInternalError, feeFails: true, stop: "publish",
+			tickets: 3, heldLock: true},
+		{name: "second ticket not published, no fee errors", feeAddrErr: types.ErrFeeAlreadyReceived, stop: "publish"},
+		{name: "fee set beyond the ticket count", feeAddrErr: types.ErrInternalError, feeFails: true,
+			tickets: 3, lowBalance: true},
+		{name: "purchase cancelled", feeAddrErr: types.ErrInternalError, feeFails: true, stop: "cancel"},
+		// The first fee fails with errors.Locked, which must not become
+		// the stopped purchase's kind.
+		{name: "second ticket not published, wallet locked", lockAtPublish: true, feeFails: true, stop: "publish"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			ctx := context.Background()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
 			var (
 				mu         sync.Mutex
 				c          *VSPClient
@@ -65,19 +99,28 @@ func TestVSPPurchaseTicketsFeeInputs(t *testing.T) {
 				attemptOps []wire.OutPoint                 // inputs of the scheduled attempts
 				seen       = make(map[chainhash.Hash]bool) // tickets asked a fee address
 				reserved   map[outpoint]struct{}           // locked at the first fee address request
+				held       map[outpoint]struct{}           // locked by the concurrent purchase
 				paid       []*wire.MsgTx
 			)
+			// snapshot records the locked fee inputs; the caller holds mu.
+			snapshot := func() {
+				w := c.wallet
+				w.lockedOutpointMu.Lock()
+				reserved = maps.Clone(w.lockedOutpoints)
+				w.lockedOutpointMu.Unlock()
+				for _, op := range attemptOps {
+					delete(reserved, outpoint{op.Hash, op.Index})
+				}
+			}
 			feeAddress := func(body []byte) (int, any) {
 				if reserved == nil {
+					snapshot()
 					w := c.wallet
-					w.lockedOutpointMu.Lock()
-					reserved = maps.Clone(w.lockedOutpoints)
-					w.lockedOutpointMu.Unlock()
-					for _, op := range attemptOps {
-						delete(reserved, outpoint{op.Hash, op.Index})
-					}
 					if tc.lock {
 						w.Lock()
+					}
+					if tc.stop == "cancel" {
+						cancel()
 					}
 				}
 				var req types.FeeAddressRequest
@@ -174,8 +217,12 @@ func TestVSPPurchaseTicketsFeeInputs(t *testing.T) {
 			for range count {
 				fund.AddTxOut(&wire.TxOut{Value: 1e7, Version: ver, PkScript: script})
 			}
-			for range 24 {
-				fund.AddTxOut(&wire.TxOut{Value: output, Version: ver, PkScript: script})
+			outputs, value := 24, int64(output)
+			if tc.lowBalance {
+				outputs, value = 7, 6e6
+			}
+			for range outputs {
+				fund.AddTxOut(&wire.TxOut{Value: value, Version: ver, PkScript: script})
 			}
 			var ops []wire.OutPoint
 			for i := range count {
@@ -212,21 +259,97 @@ func TestVSPPurchaseTicketsFeeInputs(t *testing.T) {
 			c, feeAddr, attemptOps = vsp, addr.(Address), ops
 			mu.Unlock()
 
-			resp, err := w.PurchaseTickets(ctx, mockNetwork{}, &PurchaseTicketsRequest{
-				Count:     count,
+			var n NetworkBackend = mockNetwork{}
+			if tc.stop == "publish" {
+				f := ticketPublishFails{failAt: 2, n: new(atomic.Int32)}
+				if tc.lockAtPublish {
+					f.first = func() {
+						mu.Lock()
+						snapshot()
+						mu.Unlock()
+						w.Lock()
+					}
+				}
+				if tc.heldLock {
+					f.second = func() {
+						mu.Lock()
+						defer mu.Unlock()
+						held = make(map[outpoint]struct{})
+						for op := range reserved {
+							if !w.LockedOutpoint(&op.hash, op.index) {
+								w.LockOutpoint(&op.hash, op.index)
+								held[op] = struct{}{}
+							}
+						}
+					}
+				}
+				n = f
+			}
+			buy := count
+			if tc.tickets != 0 {
+				buy = tc.tickets
+			}
+			resp, err := w.PurchaseTickets(ctx, n, &PurchaseTicketsRequest{
+				Count:     buy,
 				VSPClient: vsp,
 			})
-			if (err != nil && !tc.feeFails) || resp == nil {
+			if (err != nil && !tc.feeFails && tc.stop == "") || resp == nil {
 				t.Fatal(err)
 			}
-			if len(resp.Tickets) != count {
-				t.Fatalf("%d tickets, want %d", len(resp.Tickets), count)
+			if tc.stop != "" {
+				stopErr := errTicketPublish
+				if tc.stop == "cancel" {
+					stopErr = context.Canceled
+				}
+				switch {
+				case !tc.feeFails:
+					// Without fee errors, the error is as on main.
+					if want := "wallet.PurchaseTickets: " + stopErr.Error(); err == nil || err.Error() != want {
+						t.Errorf("PurchaseTickets: %v; want %q", err, want)
+					}
+				case !errors.Is(err, stopErr) ||
+					!strings.Contains(err.Error(), resp.TicketHashes[0].String()):
+					t.Errorf("PurchaseTickets: %v; want %v and the first ticket's fee error",
+						err, stopErr)
+				}
+				// RPC handlers report every ticket as bought on
+				// ErrVSPFeeNotPaid; the second was not published.
+				if errors.Is(err, ErrVSPFeeNotPaid) {
+					t.Errorf("PurchaseTickets: %v; want no ErrVSPFeeNotPaid", err)
+				}
+				// The stop errors here have no kind.
+				var kind errors.Kind
+				if errors.As(err, &kind) {
+					t.Errorf("PurchaseTickets: %v; kind %v, want none", err, kind)
+				}
+				mu.Lock()
+				feeSteps := len(seen)
+				mu.Unlock()
+				if feeSteps > 1 {
+					t.Errorf("%d tickets asked for a fee address, want at most the first", feeSteps)
+				}
+			}
+			wantTickets := buy
+			if tc.lowBalance {
+				wantTickets = 2
+			}
+			if len(resp.Tickets) != wantTickets {
+				t.Fatalf("%d tickets, want %d", len(resp.Tickets), wantTickets)
 			}
 
 			mu.Lock()
 			defer mu.Unlock()
-			if len(reserved) < count {
-				t.Fatalf("%d inputs reserved for %d fees", len(reserved), count)
+			if len(reserved) < buy {
+				t.Fatalf("%d inputs reserved for %d fees", len(reserved), buy)
+			}
+			if tc.heldLock && len(held) == 0 {
+				t.Fatal("no fee inputs released before the second ticket's publish")
+			}
+			for op := range held {
+				if !w.LockedOutpoint(&op.hash, op.index) {
+					t.Errorf("input %v:%d locked by another purchase was unlocked", op.hash, op.index)
+				}
+				delete(reserved, op)
 			}
 			unspent := testUnspentOutputs(ctx, t, w)
 			for op := range reserved {
@@ -265,4 +388,35 @@ func TestVSPPurchaseTicketsFeeInputs(t *testing.T) {
 			}
 		})
 	}
+}
+
+var errTicketPublish = errors.New("ticket publish failed")
+
+// ticketPublishFails fails the publish of the failAt-th ticket, counted
+// from 1, and publishes every other tx.  first and second, if set, run when
+// the first and second ticket are published.
+type ticketPublishFails struct {
+	mockNetwork
+	n             *atomic.Int32
+	failAt        int32
+	first, second func()
+}
+
+func (f ticketPublishFails) PublishTransactions(_ context.Context, txs ...*wire.MsgTx) error {
+	for _, tx := range txs {
+		if !stake.IsSStx(tx) {
+			continue
+		}
+		i := f.n.Add(1)
+		if i == 1 && f.first != nil {
+			f.first()
+		}
+		if i == 2 && f.second != nil {
+			f.second()
+		}
+		if i == f.failAt {
+			return errTicketPublish
+		}
+	}
+	return nil
 }
