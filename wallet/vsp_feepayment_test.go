@@ -174,12 +174,14 @@ func failVSPWrites(c *VSPClient) {
 // expired, the ticket is no longer recorded as paid with the abandoned tx.
 func TestVSPExpiredFeeMarksErrored(t *testing.T) {
 	for _, tc := range []struct {
-		name       string
-		published  bool // the job's fee tx is one the wallet published
-		failWrites bool
+		name        string
+		published   bool // the job's fee tx is one the wallet published
+		failWrites  bool
+		otherTicket bool // another ticket's record names the job's fee tx
 	}{
 		{name: "unpublished fee tx"},
 		{name: "published fee tx", published: true},
+		{name: "another ticket names the fee tx", otherTicket: true},
 		// The VSP's error is returned, not the failed write's.
 		{name: "status write fails", failWrites: true},
 	} {
@@ -193,6 +195,12 @@ func TestVSPExpiredFeeMarksErrored(t *testing.T) {
 			insertUnmined(ctx, t, c.wallet, feeTx, !tc.published)
 			if err := ticket.UpdateFeePaid(ctx, feeTx.TxHash(), c.URL, c.PubKey); err != nil {
 				t.Fatal(err)
+			}
+			if tc.otherTicket {
+				other := testVSPTicket(ctx, t, c, 3)
+				if err := other.UpdateFeeStarted(ctx, feeTx.TxHash(), c.URL, c.PubKey); err != nil {
+					t.Fatal(err)
+				}
 			}
 			if tc.failWrites {
 				failVSPWrites(c)
@@ -230,8 +238,9 @@ func TestVSPExpiredFeeMarksErrored(t *testing.T) {
 			}
 			expired := feeTx.TxHash()
 			_, _, err := c.wallet.TxBlock(ctx, &expired)
-			if gone := errors.Is(err, errors.NotExist); gone == tc.published {
-				t.Fatalf("expired fee tx gone from the wallet: %v, want %v (err %v)", gone, !tc.published, err)
+			kept := tc.published || tc.otherTicket
+			if gone := errors.Is(err, errors.NotExist); gone == kept {
+				t.Fatalf("expired fee tx gone from the wallet: %v, want %v (err %v)", gone, !kept, err)
 			}
 		})
 	}
@@ -300,10 +309,11 @@ func TestVSPRejectedNewFeeTxIsAbandoned(t *testing.T) {
 // When it can, the ticket is recorded as errored.
 func TestVSPRejectedFeeTxIsAbandoned(t *testing.T) {
 	for _, tc := range []struct {
-		name       string
-		code       types.ErrorCode
-		failWrites bool
-		published  bool
+		name        string
+		code        types.ErrorCode
+		failWrites  bool
+		published   bool
+		otherTicket bool // another ticket's record names the fee tx
 	}{
 		{name: "invalid, status written", code: types.ErrInvalidFeeTx},
 		{name: "invalid, status write fails", code: types.ErrInvalidFeeTx, failWrites: true},
@@ -311,6 +321,7 @@ func TestVSPRejectedFeeTxIsAbandoned(t *testing.T) {
 		{name: "unknown outputs", code: types.ErrCannotBroadcastFeeUnknownOutputs},
 		// The VSP names a tx the wallet published: it stays.
 		{name: "published tx", code: types.ErrInvalidFeeTx, published: true},
+		{name: "another ticket names the tx", code: types.ErrInvalidFeeTx, otherTicket: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -323,6 +334,12 @@ func TestVSPRejectedFeeTxIsAbandoned(t *testing.T) {
 			feeHash := feeTx.TxHash()
 			if err := ticket.UpdateFeeStarted(ctx, feeHash, c.URL, c.PubKey); err != nil {
 				t.Fatal(err)
+			}
+			if tc.otherTicket {
+				other := testVSPTicket(ctx, t, c, 3)
+				if err := other.UpdateFeeStarted(ctx, feeHash, c.URL, c.PubKey); err != nil {
+					t.Fatal(err)
+				}
 			}
 			if tc.failWrites {
 				failVSPWrites(c)
@@ -350,8 +367,9 @@ func TestVSPRejectedFeeTxIsAbandoned(t *testing.T) {
 			}
 			fp.stop()
 			_, _, err = c.wallet.TxBlock(ctx, &feeHash)
-			if gone := errors.Is(err, errors.NotExist); gone == tc.published {
-				t.Fatalf("fee tx gone from the wallet: %v, want %v (err %v)", gone, !tc.published, err)
+			kept := tc.published || tc.otherTicket
+			if gone := errors.Is(err, errors.NotExist); gone == kept {
+				t.Fatalf("fee tx gone from the wallet: %v, want %v (err %v)", gone, !kept, err)
 			}
 			fp.mu.Lock()
 			fee := fp.fee

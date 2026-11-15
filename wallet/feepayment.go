@@ -20,6 +20,7 @@ import (
 	"github.com/monetarium/monetarium-node/txscript/stdaddr"
 	"github.com/monetarium/monetarium-node/wire"
 	"github.com/decred/vspd/types/v3"
+	"github.com/monetarium/monetarium-wallet/wallet/udb"
 	"github.com/monetarium/monetarium-wallet/wallet/walletdb"
 )
 
@@ -96,36 +97,55 @@ func (fp *vspFeePayment) removedExpiredOrSpent() bool {
 	return false
 }
 
-// abandonFeeTx removes an unpublished fee tx from the wallet so its inputs can
-// be spent again.  A tx that is not held unpublished is left alone: the hash
-// may come from the VSP, and a tx the network may have must not be forgotten.
+// abandonFeeTx abandons the job's unpublished fee tx feeHash, as
+// VSPClient.abandonFeeTx does.
 func (fp *vspFeePayment) abandonFeeTx(feeHash chainhash.Hash) {
+	fp.client.abandonFeeTx(fp.ctx, fp.ticket, feeHash)
+}
+
+// abandonFeeTx removes the ticket's unpublished fee tx feeHash from the wallet
+// so its inputs can be spent again.  A tx that is not held unpublished is left
+// alone: the hash may come from the VSP, and a tx the network may have must
+// not be forgotten.  So is one another ticket's record names: a hash the VSP
+// named may be the fee tx of another of the wallet's tickets.
+func (c *VSPClient) abandonFeeTx(ctx context.Context, ticket *VSPTicket, feeHash chainhash.Hash) {
 	if feeHash == (chainhash.Hash{}) {
 		return
 	}
-	w := fp.client.wallet
-	var unpublished bool
-	err := walletdb.View(fp.ctx, w.db, func(dbtx walletdb.ReadTx) error {
+	w := c.wallet
+	var unpublished, otherTicket bool
+	err := walletdb.View(ctx, w.db, func(dbtx walletdb.ReadTx) error {
 		recs, err := w.txStore.UnminedTxs(dbtx)
+		if err != nil {
+			return err
+		}
 		for _, rec := range recs {
 			if rec.Hash == feeHash {
 				unpublished = rec.Unpublished
 				break
 			}
 		}
-		return err
+		if !unpublished {
+			return nil
+		}
+		return udb.ForEachVSPTicket(dbtx, func(h chainhash.Hash, t *udb.VSPTicket) error {
+			if h != *ticket.Hash() && t.FeeHash == feeHash {
+				otherTicket = true
+			}
+			return nil
+		})
 	})
-	if err != nil || !unpublished {
-		fp.client.log.Warnf("Ticket %v: not abandoning fee tx %v: unpublished %v, err %v",
-			fp.ticket, feeHash, unpublished, err)
+	if err != nil || !unpublished || otherTicket {
+		c.log.Warnf("Ticket %v: not abandoning fee tx %v: unpublished %v, "+
+			"another ticket's %v, err %v", ticket, feeHash, unpublished, otherTicket, err)
 		return
 	}
-	err = w.AbandonTransaction(fp.ctx, &feeHash)
+	err = w.AbandonTransaction(ctx, &feeHash)
 	if err != nil {
-		fp.client.log.Errorf("Ticket %v: abandon fee tx %v: %v", fp.ticket, feeHash, err)
+		c.log.Errorf("Ticket %v: abandon fee tx %v: %v", ticket, feeHash, err)
 		return
 	}
-	fp.client.log.Infof("Ticket %v: abandoned fee tx %v", fp.ticket, feeHash)
+	c.log.Infof("Ticket %v: abandoned fee tx %v", ticket, feeHash)
 }
 
 func (fp *vspFeePayment) remove(reason string) {
@@ -616,8 +636,8 @@ func (fp *vspFeePayment) recordReceivedFee() error {
 	}
 	if ownHash != *feeHash {
 		// The job's fee tx will never be paid; abandoning it frees its
-		// inputs.  abandonFeeTx skips a zero hash, a published tx and a
-		// tx the wallet does not hold.
+		// inputs.  abandonFeeTx skips a zero hash, a published tx, a tx
+		// the wallet does not hold and one another ticket's record names.
 		fp.abandonFeeTx(ownHash)
 	}
 	return fp.confirmPayment()

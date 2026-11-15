@@ -32,6 +32,7 @@ func TestVSPFeeAlreadyReceivedAbandonsOwnFeeTx(t *testing.T) {
 		hashOnly    bool                         // the job holds the tx's hash but not the tx
 		status      func(body []byte) (int, any) // nil: the VSP's fee tx, received
 		failWrites  bool                         // recording the VSP's hash fails
+		otherTicket bool                         // another ticket's record names the job's fee tx
 		wantUnspent bool
 	}{
 		{name: "VSP names another fee tx", wantUnspent: true},
@@ -45,6 +46,7 @@ func TestVSPFeeAlreadyReceivedAbandonsOwnFeeTx(t *testing.T) {
 			return http.StatusOK, types.TicketStatusResponse{FeeTxStatus: "received", Request: body}
 		}},
 		{name: "recording the VSP's hash fails", failWrites: true},
+		{name: "another ticket names the job's fee tx", otherTicket: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -100,6 +102,12 @@ func TestVSPFeeAlreadyReceivedAbandonsOwnFeeTx(t *testing.T) {
 				fp.feeTx = nil
 			}
 			c.jobs[*ticket.Hash()] = fp // stopped on cleanup
+			if tc.otherTicket {
+				other := testVSPTicket(ctx, t, c, 3)
+				if err := other.UpdateFeeStarted(ctx, ownHash, c.URL, c.PubKey); err != nil {
+					t.Fatal(err)
+				}
+			}
 			if tc.failWrites {
 				failVSPWrites(c)
 			}
