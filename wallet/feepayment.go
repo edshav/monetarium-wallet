@@ -580,11 +580,18 @@ func isFeeAlreadyReceived(err error) bool {
 // paid, and confirms it.  The VSP answers a fee address request with
 // ErrFeeAlreadyReceived once it holds a fee tx, for example one paid before the
 // wallet was restored from seed.  The job stops using its own fee tx and fee
-// quote, so a retry asks the VSP again; the fee tx itself stays in the wallet.
+// quote, so a retry asks the VSP again.  Once the VSP names its fee tx, a
+// finished fee tx the job holds that is not that one is abandoned if unpublished.
 func (fp *vspFeePayment) recordReceivedFee() error {
 	ctx := fp.ctx
 
 	fp.mu.Lock()
+	// The job's fee tx, if it holds one.  Not fp.feeHash, which an earlier
+	// reply may have set to a hash the VSP named.
+	var ownHash chainhash.Hash
+	if fp.feeTx != nil && len(fp.feeTx.TxOut) != 0 {
+		ownHash = fp.feeTx.TxHash()
+	}
 	fp.feeTx = nil
 	fp.fee = 0
 	fp.mu.Unlock()
@@ -606,6 +613,12 @@ func (fp *vspFeePayment) recordReceivedFee() error {
 	if err != nil {
 		fp.schedule("reconcile payment", fp.reconcilePayment)
 		return err
+	}
+	if ownHash != *feeHash {
+		// The job's fee tx will never be paid; abandoning it frees its
+		// inputs.  abandonFeeTx skips a zero hash, a published tx and a
+		// tx the wallet does not hold.
+		fp.abandonFeeTx(ownHash)
 	}
 	return fp.confirmPayment()
 }
