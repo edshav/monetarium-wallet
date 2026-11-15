@@ -58,6 +58,11 @@ type vspFeePayment struct {
 	feeTx   *wire.MsgTx
 	state   State
 	err     error
+	// ownFeeHash is the last fee tx of the job's own that recordReceivedFee
+	// dropped.  It abandons it once the VSP's recorded fee tx is another
+	// one, on that call or a later one: the VSP replaces its fee tx only
+	// after the one it held errored.
+	ownFeeHash chainhash.Hash
 
 	timerMu sync.Mutex
 	timer   *time.Timer
@@ -601,17 +606,19 @@ func isFeeAlreadyReceived(err error) bool {
 // ErrFeeAlreadyReceived once it holds a fee tx, for example one paid before the
 // wallet was restored from seed.  The job stops using its own fee tx and fee
 // quote, so a retry asks the VSP again.  Once the VSP names its fee tx, a
-// finished fee tx the job holds that is not that one is abandoned if unpublished.
+// finished fee tx the job holds, or the one an earlier call dropped and kept
+// in ownFeeHash, is abandoned if it is not that one and is unpublished.
 func (fp *vspFeePayment) recordReceivedFee() error {
 	ctx := fp.ctx
 
 	fp.mu.Lock()
-	// The job's fee tx, if it holds one.  Not fp.feeHash, which an earlier
-	// reply may have set to a hash the VSP named.
-	var ownHash chainhash.Hash
+	// The job's fee tx, if it holds one, or the one an earlier call
+	// dropped before it could record the VSP's.  Not fp.feeHash, which an
+	// earlier reply may have set to a hash the VSP named.
 	if fp.feeTx != nil && len(fp.feeTx.TxOut) != 0 {
-		ownHash = fp.feeTx.TxHash()
+		fp.ownFeeHash = fp.feeTx.TxHash()
 	}
+	ownHash := fp.ownFeeHash
 	fp.feeTx = nil
 	fp.fee = 0
 	fp.mu.Unlock()
