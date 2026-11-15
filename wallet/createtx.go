@@ -2539,7 +2539,7 @@ func (w *Wallet) findEligibleOutputs(dbtx walletdb.ReadTx, account uint32, minco
 				continue
 			}
 		case stdscript.STStakeChangePubKeyHash, stdscript.STStakeChangeScriptHash:
-			if !ticketChangeMatured(w.chainParams, output.Height, currentHeight) {
+			if !udb.TicketChangeMatured(w.chainParams, output.HasExpiry, output.Height, currentHeight) {
 				continue
 			}
 		case stdscript.STPubKeyHashEcdsaSecp256k1:
@@ -2668,7 +2668,7 @@ func (w *Wallet) findEligibleOutputsAmount(dbtx walletdb.ReadTx, account uint32,
 				return true
 			}
 		case stdscript.STStakeChangePubKeyHash, stdscript.STStakeChangeScriptHash:
-			if !ticketChangeMatured(w.chainParams, output.Height, currentHeight) {
+			if !udb.TicketChangeMatured(w.chainParams, output.HasExpiry, output.Height, currentHeight) {
 				return true
 			}
 		case stdscript.STPubKeyHashEcdsaSecp256k1:

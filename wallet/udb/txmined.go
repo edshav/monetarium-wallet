@@ -3453,9 +3453,18 @@ func coinbaseMatured(params *chaincfg.Params, txHeight, curHeight int32) bool {
 
 // ticketChangeMatured returns whether a ticket change mined at
 // txHeight has reached ticket maturity in a chain with a tip height
-// curHeight.
+// curHeight.  It ignores expiry; decide a credit with TicketChangeMatured.
 func ticketChangeMatured(params *chaincfg.Params, txHeight, curHeight int32) bool {
 	return txHeight >= 0 && curHeight-txHeight+1 > int32(params.SStxChangeMaturity)
+}
+
+// TicketChangeMatured returns whether a ticket change output mined at txHeight
+// may be spent in a chain with tip height curHeight.  Change of a ticket with
+// an expiry also needs coinbase maturity, as mond requires for every output of
+// a transaction with an expiry.
+func TicketChangeMatured(params *chaincfg.Params, hasExpiry bool, txHeight, curHeight int32) bool {
+	return ticketChangeMatured(params, txHeight, curHeight) &&
+		(!hasExpiry || coinbaseMatured(params, txHeight, curHeight))
 }
 
 // SSFeeMatured returns whether an output of an SSFee transaction mined at
@@ -3872,7 +3881,7 @@ func (s *Store) MakeInputSourceWithCoinType(dbtx walletdb.ReadTx, account uint32
 					}
 				}
 				if opcode == txscript.OP_SSTXCHANGE {
-					if !ticketChangeMatured(s.chainParams, txHeight, syncHeight) {
+					if !TicketChangeMatured(s.chainParams, fetchRawCreditHasExpiry(cVal, DBVersion), txHeight, syncHeight) {
 						continue
 					}
 				}
@@ -4161,7 +4170,7 @@ func (s *Store) balanceFullScan(dbtx walletdb.ReadTx, minConf int32, syncHeight 
 					ab.Total += utxoAmt
 				}
 			case txscript.OP_SSTXCHANGE:
-				if ticketChangeMatured(s.chainParams, height, syncHeight) {
+				if TicketChangeMatured(s.chainParams, fetchRawCreditHasExpiry(cVal, DBVersion), height, syncHeight) {
 					// Update per-coin balance
 					coinBalance.Spendable += utxoAmt
 					// Update legacy VAR balance for backward compatibility
@@ -4766,7 +4775,7 @@ func (s *Store) AccountBalanceByCoinType(dbtx walletdb.ReadTx, minConf int32, ac
 				}
 
 			case txscript.OP_SSTXCHANGE:
-				if ticketChangeMatured(s.chainParams, height, syncHeight) {
+				if TicketChangeMatured(s.chainParams, fetchRawCreditHasExpiry(cVal, DBVersion), height, syncHeight) {
 					balance.Spendable += utxoAmt
 					if isSKA {
 						balance.SKASpendable = balance.SKASpendable.Add(skaAmt)
