@@ -40,6 +40,7 @@ type vspPaymentFixture struct {
 	tip     wire.BlockHeader
 	n       byte
 	feeAcct uint32
+	sbits   int64 // the ticket price in the headers of mined outputs' blocks
 }
 
 func newVSPPaymentFixture(ctx context.Context, t *testing.T) *vspPaymentFixture {
@@ -91,6 +92,7 @@ func (f *vspPaymentFixture) fundCoin(ctx context.Context, t *testing.T, mined bo
 		PrevBlock: f.tip.BlockHash(),
 		Height:    f.tip.Height + 1,
 		Bits:      f.cfg.Params.PowLimitBits,
+		SBits:     f.sbits,
 		VoteBits:  1, // approve the previous block, or its outputs are invalidated
 	}
 	filter, err := blockcf2.Regular(&wire.MsgBlock{Header: header}, nil)

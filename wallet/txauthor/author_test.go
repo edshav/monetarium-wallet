@@ -112,10 +112,11 @@ func TestNewUnsignedTransaction(t *testing.T) {
 			InputCount: 1,
 		},
 
-		// Test dust thresholds (603 for a 1e3 relay fee).
+		// Test dust thresholds (606 for a 1e3 relay fee: a VAR output is 37
+		// bytes on the wire, its coin type byte included).
 		5: {
 			UnspentOutputs: p2pkhOutputs(1e8),
-			Outputs: p2pkhOutputs(1e8 - 602 - txrules.FeeForSerializeSize(1e3,
+			Outputs: p2pkhOutputs(1e8 - 605 - txrules.FeeForSerializeSize(1e3,
 				txsizes.EstimateSerializeSize([]int{txsizes.RedeemP2PKHSigScriptSize}, p2pkhOutputs(0), txsizes.P2PKHPkScriptSize))),
 			RelayFee:     cointype.SKAAmountFromInt64(1e3),
 			ChangeAmount: 0,
@@ -123,17 +124,17 @@ func TestNewUnsignedTransaction(t *testing.T) {
 		},
 		6: {
 			UnspentOutputs: p2pkhOutputs(1e8),
-			Outputs: p2pkhOutputs(1e8 - 603 - txrules.FeeForSerializeSize(1e3,
+			Outputs: p2pkhOutputs(1e8 - 606 - txrules.FeeForSerializeSize(1e3,
 				txsizes.EstimateSerializeSize([]int{txsizes.RedeemP2PKHSigScriptSize}, p2pkhOutputs(0), txsizes.P2PKHPkScriptSize))),
 			RelayFee:     cointype.SKAAmountFromInt64(1e3),
-			ChangeAmount: 603,
+			ChangeAmount: 606,
 			InputCount:   1,
 		},
 
-		// Test dust thresholds (1537.65 for a 2.55e3 relay fee).
+		// Test dust thresholds (1545.3 for a 2.55e3 relay fee).
 		7: {
 			UnspentOutputs: p2pkhOutputs(1e8),
-			Outputs: p2pkhOutputs(1e8 - 1537 - txrules.FeeForSerializeSize(2.55e3,
+			Outputs: p2pkhOutputs(1e8 - 1545 - txrules.FeeForSerializeSize(2.55e3,
 				txsizes.EstimateSerializeSize([]int{txsizes.RedeemP2PKHSigScriptSize}, p2pkhOutputs(0), txsizes.P2PKHPkScriptSize))),
 			RelayFee:     cointype.SKAAmountFromInt64(2550),
 			ChangeAmount: 0,
@@ -141,10 +142,10 @@ func TestNewUnsignedTransaction(t *testing.T) {
 		},
 		8: {
 			UnspentOutputs: p2pkhOutputs(1e8),
-			Outputs: p2pkhOutputs(1e8 - 1538 - txrules.FeeForSerializeSize(2.55e3,
+			Outputs: p2pkhOutputs(1e8 - 1546 - txrules.FeeForSerializeSize(2.55e3,
 				txsizes.EstimateSerializeSize([]int{txsizes.RedeemP2PKHSigScriptSize}, p2pkhOutputs(0), txsizes.P2PKHPkScriptSize))),
 			RelayFee:     cointype.SKAAmountFromInt64(2550),
-			ChangeAmount: 1538,
+			ChangeAmount: 1546,
 			InputCount:   1,
 		},
 
@@ -153,10 +154,10 @@ func TestNewUnsignedTransaction(t *testing.T) {
 		// serialize size for each).
 		9: {
 			UnspentOutputs: p2pkhOutputs(1e8, 1e8),
-			Outputs: p2pkhOutputs(1e8 - 603 - txrules.FeeForSerializeSize(1e3,
+			Outputs: p2pkhOutputs(1e8 - 606 - txrules.FeeForSerializeSize(1e3,
 				txsizes.EstimateSerializeSize([]int{txsizes.RedeemP2PKHSigScriptSize}, p2pkhOutputs(0), txsizes.P2PKHPkScriptSize))),
 			RelayFee:     cointype.SKAAmountFromInt64(1e3),
-			ChangeAmount: 603,
+			ChangeAmount: 606,
 			InputCount:   1,
 		},
 

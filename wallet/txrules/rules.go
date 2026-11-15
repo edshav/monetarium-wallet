@@ -50,18 +50,26 @@ const DefaultRelayFeePerKb dcrutil.Amount = 0.0001 * 1e8
 // outputs (whose atom values can exceed math.MaxInt64). For SKA, use
 // CheckOutput, which enforces cointype.MinSKADustAmount via SKAValue.
 func IsDustAmount(amount dcrutil.Amount, scriptSize int, relayFeePerKb dcrutil.Amount) bool {
+	return amount < DustThreshold(scriptSize, relayFeePerKb)
+}
+
+// DustThreshold returns the smallest VAR amount that is not dust for an
+// output script of scriptSize bytes.
+func DustThreshold(scriptSize int, relayFeePerKb dcrutil.Amount) dcrutil.Amount {
 	// Calculate the total (estimated) cost to the network.  This is
 	// calculated using the serialize size of the output plus the serial
 	// size of a transaction input which redeems it.  The output is assumed
 	// to be compressed P2PKH as this is the most common script type.  Use
 	// the average size of a compressed P2PKH redeem input (165) rather than
-	// the largest possible (txsizes.RedeemP2PKHInputSize).
-	totalSize := 8 + 2 + wire.VarIntSerializeSize(uint64(scriptSize)) +
+	// the largest possible (txsizes.RedeemP2PKHInputSize).  The output size
+	// is a VAR output's wire.TxOut.SerializeSize, as the node's dust check
+	// counts it: coin type, value, script version and script.
+	totalSize := 1 + 8 + 2 + wire.VarIntSerializeSize(uint64(scriptSize)) +
 		scriptSize + 165
 
 	// Dust is defined as an output value where the total cost to the network
 	// (output size + input size) is greater than 1/3 of the relay fee.
-	return int64(amount)*1000/(3*int64(totalSize)) < int64(relayFeePerKb)
+	return dcrutil.Amount((int64(relayFeePerKb)*3*int64(totalSize) + 999) / 1000)
 }
 
 // IsDustOutput determines whether a transaction output is considered dust.

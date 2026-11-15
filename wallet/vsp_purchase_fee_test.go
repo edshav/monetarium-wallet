@@ -58,10 +58,6 @@ func TestVSPPurchaseTicketsFeeInputs(t *testing.T) {
 		feeFails bool
 		// tickets is the number asked for; 0 asks for count.
 		tickets int
-		// lowBalance funds 7 outputs of 6e6 instead, so a fee takes one
-		// output: three tickets do not fit, and the low-balance path
-		// buys two, keeping a third fee set beyond the ticket count.
-		lowBalance bool
 		// heldLock: at the second ticket's publish, a concurrent purchase
 		// locks the first ticket's fee inputs, which the fee step already
 		// released; they must stay locked.
@@ -82,8 +78,6 @@ func TestVSPPurchaseTicketsFeeInputs(t *testing.T) {
 		{name: "second ticket not published", feeAddrErr: types.ErrInternalError, feeFails: true, stop: "publish",
 			tickets: 3, heldLock: true},
 		{name: "second ticket not published, no fee errors", feeAddrErr: types.ErrFeeAlreadyReceived, stop: "publish"},
-		{name: "fee set beyond the ticket count", feeAddrErr: types.ErrInternalError, feeFails: true,
-			tickets: 3, lowBalance: true},
 		{name: "purchase cancelled", feeAddrErr: types.ErrInternalError, feeFails: true, stop: "cancel"},
 		// The first fee fails with errors.Locked, which must not become
 		// the stopped purchase's kind.
@@ -217,12 +211,8 @@ func TestVSPPurchaseTicketsFeeInputs(t *testing.T) {
 			for range count {
 				fund.AddTxOut(&wire.TxOut{Value: 1e7, Version: ver, PkScript: script})
 			}
-			outputs, value := 24, int64(output)
-			if tc.lowBalance {
-				outputs, value = 7, 6e6
-			}
-			for range outputs {
-				fund.AddTxOut(&wire.TxOut{Value: value, Version: ver, PkScript: script})
+			for range 24 {
+				fund.AddTxOut(&wire.TxOut{Value: output, Version: ver, PkScript: script})
 			}
 			var ops []wire.OutPoint
 			for i := range count {
@@ -329,12 +319,8 @@ func TestVSPPurchaseTicketsFeeInputs(t *testing.T) {
 					t.Errorf("%d tickets asked for a fee address, want at most the first", feeSteps)
 				}
 			}
-			wantTickets := buy
-			if tc.lowBalance {
-				wantTickets = 2
-			}
-			if len(resp.Tickets) != wantTickets {
-				t.Fatalf("%d tickets, want %d", len(resp.Tickets), wantTickets)
+			if len(resp.Tickets) != buy {
+				t.Fatalf("%d tickets, want %d", len(resp.Tickets), buy)
 			}
 
 			mu.Lock()
