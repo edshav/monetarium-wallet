@@ -52,23 +52,9 @@ func (d *failAddressDB) BeginReadWriteTx() (walletdb.ReadWriteTx, error) {
 	if updateCalledBy(".(*Wallet).purchaseTickets") {
 		d.records++
 	}
-	if d.records >= 2 {
-		pcs := make([]uintptr, 64)
-		frames := runtime.CallersFrames(pcs[:runtime.Callers(2, pcs)])
-		for {
-			f, more := frames.Next()
-			if strings.Contains(f.Function, "ersist") || strings.Contains(f.Function, "ddress") {
-				println("FRAME", f.Function)
-			}
-			if !more {
-				break
-			}
-		}
-		println("----")
-	}
 	// The split's record comes first, then the first ticket's.  The
-	// closure persistReturnedChild returns is named by where the
-	// toolchain inlines it ("persistReturnedChild.func1", ".1", ".func13").
+	// closure persistReturnedChild returns is named by where the toolchain
+	// inlines it ("persistReturnedChild.func1", ".1", ".func13").
 	if d.records >= 2 && inCallersContaining(".(*Wallet).persistReturnedChild.") {
 		return nil, errAddressWrite
 	}
