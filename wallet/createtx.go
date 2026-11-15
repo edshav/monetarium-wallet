@@ -2202,6 +2202,20 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 	// Create each ticket.
 	ticketHashes := make([]*chainhash.Hash, 0, req.Count)
 	tickets := make([]*wire.MsgTx, 0, req.Count)
+	// unpublished drops the tickets from the first not published on,
+	// which a later rebroadcast of unmined txs would otherwise send, and
+	// reports only the published ones.  A ticket the wallet does not hold
+	// (unsigned, or its record failed) needs nothing.
+	unpublished := func(published int) {
+		for _, h := range ticketHashes[published:] {
+			abandonErr := w.AbandonTransaction(ctx, h)
+			if abandonErr != nil && !errors.Is(abandonErr, errors.NotExist) {
+				log.Errorf("Cannot abandon unpublished ticket %v: %v", h, abandonErr)
+			}
+		}
+		purchaseTicketsResponse.Tickets = tickets[:published]
+		purchaseTicketsResponse.TicketHashes = ticketHashes[:published]
+	}
 	splitOutpoint := wire.OutPoint{Hash: splitTx.TxHash()}
 	for _, index := range splitOutputIndexes {
 		// Generate the extended outpoint that we need to use for ticket
@@ -2215,23 +2229,27 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 			PrevOut:  *txOut,
 		}
 
-		addrVote, idx, err := stakeAddrFunc(op, req.VotingAccount, 1)
+		addrVote, addrSubsidy, err := func() (vote, subsidy stdaddr.StakeAddress, err error) {
+			vote, idx, err := stakeAddrFunc(op, req.VotingAccount, 1)
+			if err != nil {
+				return nil, nil, err
+			}
+			_, err = w.signingAddressAtIdx(ctx, op, w.persistReturnedChild(ctx, nil),
+				req.VotingAccount, idx)
+			if err != nil {
+				return nil, nil, err
+			}
+			subsidyAccount := req.SourceAccount
+			var branch uint32 = 1
+			if req.Mixing {
+				subsidyAccount = req.MixedAccount
+				branch = req.MixedAccountBranch
+			}
+			subsidy, _, err = stakeAddrFunc(op, subsidyAccount, branch)
+			return vote, subsidy, err
+		}()
 		if err != nil {
-			return nil, err
-		}
-		_, err = w.signingAddressAtIdx(ctx, op, w.persistReturnedChild(ctx, nil),
-			req.VotingAccount, idx)
-		if err != nil {
-			return nil, err
-		}
-		subsidyAccount := req.SourceAccount
-		var branch uint32 = 1
-		if req.Mixing {
-			subsidyAccount = req.MixedAccount
-			branch = req.MixedAccountBranch
-		}
-		addrSubsidy, _, err := stakeAddrFunc(op, subsidyAccount, branch)
-		if err != nil {
+			unpublished(0)
 			return nil, err
 		}
 
@@ -2294,6 +2312,7 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 		})
 		w.lockedOutpointMu.Unlock()
 		if err != nil {
+			unpublished(0)
 			return purchaseTicketsResponse, errors.E(op, err)
 		}
 	}
@@ -2312,11 +2331,7 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 		for i, hash := range ticketHashes {
 			vspTickets[i], err = w.NewVSPTicket(ctx, hash)
 			if err != nil {
-				for _, h := range ticketHashes {
-					if abandonErr := w.AbandonTransaction(ctx, h); abandonErr != nil {
-						log.Errorf("Cannot abandon %v: %v", h, abandonErr)
-					}
-				}
+				unpublished(0)
 				return nil, errors.E(op, errors.Errorf("VSP ticket record for %v: %w", hash, err))
 			}
 		}
@@ -2324,8 +2339,10 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 
 	var feeErrs []error
 	// stopped returns the error of a purchase that stops before publishing
-	// every ticket, keeping the fee errors of the tickets it published.
-	stopped := func(err error) (*PurchaseTicketsResponse, error) {
+	// ticket i, keeping the fee errors of the tickets it published, and
+	// drops ticket i and every later one.
+	stopped := func(i int, err error) (*PurchaseTicketsResponse, error) {
+		unpublished(i)
 		if len(feeErrs) != 0 {
 			// The fee errors as text only: their kinds must not stand for
 			// the stop's, which sets the RPC error code.
@@ -2346,25 +2363,18 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 				if !timer.Stop() {
 					<-timer.C
 				}
-				return stopped(ctx.Err())
+				return stopped(i, ctx.Err())
 			case <-timer.C:
 			}
 		} else if err := ctx.Err(); err != nil {
-			return stopped(err)
+			return stopped(i, err)
 		}
 
 		// Publish transaction
 		err = n.PublishTransactions(ctx, ticket)
 		if err != nil {
-			// The ticket was already recorded locally before publish;
-			// abandon it so wallet state stays consistent with the
-			// network. Mirrors publishAndWatch.
-			hash := ticket.TxHash()
-			log.Errorf("Abandoning ticket %v which failed to publish", &hash)
-			if abandonErr := w.AbandonTransaction(ctx, &hash); abandonErr != nil {
-				log.Errorf("Cannot abandon %v: %v", &hash, abandonErr)
-			}
-			return stopped(err)
+			log.Errorf("Ticket %v failed to publish: %v", ticket.TxHash(), err)
+			return stopped(i, err)
 		}
 		log.Infof("Published ticket purchase %v", ticket.TxHash())
 
