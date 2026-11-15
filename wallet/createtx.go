@@ -1901,6 +1901,15 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 		}
 		return
 	}
+	// Each ticket's VSPTicket needs its voting key. Fail before the split is
+	// published when the voting account cannot give one up (locked, or
+	// imported from an xpub): a ticket buyer retries every block, and each
+	// split published only to abandon its tickets costs a miner fee.
+	if req.VSPClient != nil && !req.DontSignTx {
+		if _, err := w.AccountXpriv(ctx, req.VotingAccount); err != nil {
+			return nil, errors.E(op, errors.Errorf("voting account %d: %w", req.VotingAccount, err))
+		}
+	}
 	if req.VSPClient != nil {
 		feePrice, err := req.VSPClient.FeePercentage(ctx)
 		if err != nil {
