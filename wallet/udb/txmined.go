@@ -4365,7 +4365,9 @@ func (s *Store) balanceFullScan(dbtx walletdb.ReadTx, minConf int32, syncHeight 
 
 			switch opcode {
 			case opNonstake:
-				if minConf == 0 && !unpublished {
+				// The node rejects any spend of an unmined output of a tx
+				// with an expiry, and selection skips it.
+				if minConf == 0 && !unpublished && !fetchRawCreditHasExpiry(v, DBVersion) {
 					coinBalance.Spendable += utxoAmt
 					if coinType == cointype.CoinTypeVAR {
 						ab.Spendable += utxoAmt
@@ -4478,8 +4480,9 @@ func (s *Store) balanceFullScan(dbtx walletdb.ReadTx, minConf int32, syncHeight 
 
 			switch opcode {
 			case opNonstake:
-				// SSFee MF (miner fee) or regular SKA transfers
-				if minConf == 0 && !unpublished {
+				// SSFee MF (miner fee) or regular SKA transfers.  An
+				// unmined output with an expiry is not spendable, as above.
+				if minConf == 0 && !unpublished && !fetchRawCreditHasExpiry(v, DBVersion) {
 					coinBalance.Spendable += utxoAmt
 					coinBalance.SKASpendable = coinBalance.SKASpendable.Add(skaAmt)
 				} else if !fetchRawUnminedCreditTagIsCoinbase(v) {

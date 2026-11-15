@@ -1782,8 +1782,9 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 	if req.MinConf == 0 {
 		// AccountBalanceByCoinType never counts unmined credits as
 		// Spendable. Selection at minconf 0 spends published non-stake
-		// ones, as the VSP fee-split retry in PurchaseTickets needs, and
-		// AccountBalance counts those as Spendable.
+		// ones without an expiry, as the VSP fee-split retry in
+		// PurchaseTickets needs, and AccountBalance counts those as
+		// Spendable.
 		bal, err := w.AccountBalance(ctx, req.SourceAccount, 0)
 		if err != nil {
 			return nil, errors.E(op, err)

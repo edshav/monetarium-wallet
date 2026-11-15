@@ -356,11 +356,11 @@ func TestPurchaseTicketsPreflightBalance(t *testing.T) {
 		name: "mined output with expiry, minconf 0", mined: true, expiry: 1000,
 		minConf: 0, wantAcct: 0, wantByCoin: amt, wantPreflight: true,
 	}, {
-		// A published unmined output with an expiry counts as spendable
-		// at minconf 0, though the node rejects its spend until it is
-		// mined and mature: the check lets the purchase through.
+		// The node rejects any spend of an unmined output with an expiry,
+		// so AccountBalance leaves it out of Spendable at minconf 0, as
+		// selection does, and the check refuses.
 		name: "unmined output with expiry, minconf 0", expiry: 1000,
-		minConf: 0, wantAcct: amt, wantByCoin: 0,
+		minConf: 0, wantAcct: 0, wantByCoin: 0, wantPreflight: true,
 	}, {
 		// Selection skips outputs of unpublished txs at any minconf.
 		name: "unpublished tx, minconf 0", unpublished: true,
