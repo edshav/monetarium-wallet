@@ -751,12 +751,13 @@ func (fp *vspFeePayment) confirmPayment() (err error) {
 		fp.schedule("confirm payment", fp.confirmPayment)
 		return nil
 	case "confirmed":
-		fp.remove("confirmed by VSP")
-		// nothing scheduled
+		// Removed only once recorded: a removed job's retry does nothing.
 		err = fp.ticket.UpdateFeeConfirmed(ctx, feeHash, fp.client.URL, fp.client.PubKey)
 		if err != nil {
 			return err
 		}
+		fp.remove("confirmed by VSP")
+		// nothing scheduled
 		return nil
 	case "error":
 		fp.client.log.Warnf("VSP failed to broadcast feetx for %v -- restarting payment",

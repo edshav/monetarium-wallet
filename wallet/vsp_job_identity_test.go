@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/monetarium/monetarium-node/chaincfg/chainhash"
 	"github.com/monetarium/monetarium-node/wire"
 	"github.com/monetarium/monetarium-wallet/errors"
+	"github.com/monetarium/monetarium-wallet/wallet/udb"
 )
 
 // TestVSPRemovedJobDoesNotPayTwice runs the sequence where a Process call
@@ -328,5 +330,64 @@ func TestVSPRemovedJobRestartPays(t *testing.T) {
 				t.Fatalf("the ticket's job after Process is %p, want a new job", job)
 			}
 		})
+	}
+}
+
+// TestVSPFailedConfirmedWriteIsRetried checks that when a scheduled attempt
+// learns from the VSP that the fee is confirmed but cannot write the confirmed
+// status, the job stays listed with a retry scheduled, and the retry records
+// the confirmation.
+func TestVSPFailedConfirmedWriteIsRetried(t *testing.T) {
+	ctx := context.Background()
+	feeHash := chainhash.Hash{0xfe}
+	c := testVSPClient(ctx, t, func(path string, body []byte) (int, any) {
+		switch {
+		case strings.HasSuffix(path, "/api/v3/ticketstatus"):
+			return http.StatusOK, types.TicketStatusResponse{
+				FeeTxStatus: "confirmed",
+				FeeTxHash:   feeHash.String(),
+				Request:     body,
+			}
+		case strings.HasSuffix(path, "/api/v3/feeaddress"):
+			return apiError(types.ErrFeeAlreadyReceived)
+		}
+		return apiError(types.ErrInternalError)
+	})
+	ticket := testVSPTicket(ctx, t, c, 1)
+	if err := ticket.UpdateFeePaid(ctx, feeHash, c.URL, c.PubKey); err != nil {
+		t.Fatal(err)
+	}
+	fp := c.feePayment(ctx, ticket, true)
+	fp.stop()
+	url := c.URL
+	failVSPWrites(c)
+	fp.task("confirm payment", fp.confirmPayment)()
+	if !fp.listed() || !timerSet(fp) {
+		fp.stop()
+		t.Fatal("a failed confirmed write left no retry")
+	}
+	fp.stop()
+	info, err := ticket.VSPTicketInfo(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if udb.FeeStatus(info.FeeTxStatus) != udb.VSPFeeProcessPaid {
+		t.Fatalf("after the failed write: fee status %v, want paid", udb.FeeStatus(info.FeeTxStatus))
+	}
+
+	// The write works again, and the retry runs as its timer would.
+	c.URL = url
+	fp.task("reconcile payment", fp.reconcilePayment)()
+	info, err = ticket.VSPTicketInfo(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if udb.FeeStatus(info.FeeTxStatus) != udb.VSPFeeProcessConfirmed || info.FeeHash != feeHash {
+		t.Fatalf("after the retry: fee status %v, hash %v; want confirmed, %v",
+			udb.FeeStatus(info.FeeTxStatus), info.FeeHash, feeHash)
+	}
+	if fp.listed() || timerSet(fp) {
+		fp.stop()
+		t.Fatal("the job was kept after the confirmation was recorded")
 	}
 }
