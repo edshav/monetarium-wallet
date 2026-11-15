@@ -458,6 +458,17 @@ type addressBuffer struct {
 	// to children beyond the last returned child recorded in the database.
 	cursor      uint32
 	lastWatched uint32
+	// current is the child getaccountaddress returned, kept in memory
+	// only.  It is valid while haveCurrent and unused, and
+	// NewExternalAddress and a SyncLastReturnedAddress reaching it clear it.
+	current     uint32
+	haveCurrent bool
+}
+
+// currentChild returns the child getaccountaddress returned while it is
+// unused, and false otherwise.
+func (b *addressBuffer) currentChild() (uint32, bool) {
+	return b.current, b.haveCurrent && b.current+1 > b.lastUsed+1
 }
 
 type bip0044AccountData struct {
@@ -741,8 +752,18 @@ func (w *Wallet) NewExternalAddress(ctx context.Context, account uint32, callOpt
 	}
 
 	accountName, _ := w.AccountName(ctx, account)
-	return w.nextAddress(ctx, op, w.persistReturnedChild(ctx, nil),
+	addr, err := w.nextAddress(ctx, op, w.persistReturnedChild(ctx, nil),
 		accountName, account, udb.ExternalBranch, callOpts...)
+	if err != nil {
+		return nil, err
+	}
+	// A requested new address replaces the one getaccountaddress returns.
+	w.addressBuffersMu.Lock()
+	if ad, ok := w.addressBuffers[account]; ok {
+		ad.albExternal.haveCurrent = false
+	}
+	w.addressBuffersMu.Unlock()
+	return addr, nil
 }
 
 // NewInternalAddress returns an internal address.
@@ -836,6 +857,12 @@ func (w *Wallet) SyncLastReturnedAddress(ctx context.Context, account, branch, c
 		lastUsed   uint32
 	)
 	err := func() error {
+		// getaccountaddress remembers its address only after taking it,
+		// so a sync of its branch between the two would miss it.
+		if branch == udb.ExternalBranch {
+			w.currentAddressMu.Lock()
+			defer w.currentAddressMu.Unlock()
+		}
 		defer w.addressBuffersMu.Unlock()
 		w.addressBuffersMu.Lock()
 
@@ -865,6 +892,11 @@ func (w *Wallet) SyncLastReturnedAddress(ctx context.Context, account, branch, c
 			if next := child - lastUsed; next > alb.cursor {
 				alb.cursor = next
 			}
+		}
+		// Another wallet on the same seed may have handed out every
+		// child up to child, so getaccountaddress must not return one.
+		if branch == udb.ExternalBranch && alb.haveCurrent && child >= alb.current {
+			alb.haveCurrent = false
 		}
 		return nil
 	}()
