@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
+	"time"
 
 	"github.com/monetarium/monetarium-wallet/errors"
 	"github.com/monetarium/monetarium-wallet/wallet/udb"
@@ -114,6 +115,11 @@ type VSPClientConfig struct {
 	Policy *VSPPolicy
 }
 
+// vspRequestTimeout bounds each request to the VSP.  Fee processing for a
+// ticket holds its lock across these requests, so a VSP that never answers
+// would otherwise block every later attempt for that ticket.
+var vspRequestTimeout = 30 * time.Second
+
 func (w *Wallet) NewVSPClient(cfg VSPClientConfig, log slog.Logger, dialer DialFunc) (*VSPClient, error) {
 	if cfg.URL == "" {
 		return nil, errors.New("vsp url can not be null")
@@ -141,6 +147,7 @@ func (w *Wallet) NewVSPClient(cfg VSPClientConfig, log slog.Logger, dialer DialF
 	client.Transport = &http.Transport{
 		DialContext: dialer,
 	}
+	client.Timeout = vspRequestTimeout
 
 	v := &VSPClient{
 		wallet:   w,
