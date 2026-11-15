@@ -2297,7 +2297,9 @@ func (w *Wallet) PurchaseTickets(ctx context.Context, n NetworkBackend,
 	txsize := txsizes.EstimateSerializeSize([]int{txsizes.RedeemP2PKHInputSize},
 		a.outputs, txsizes.P2PKHPkScriptSize)
 	txfee := txrules.FeeForSerializeSize(relayFee, txsize)
-	a.outputs[0].Value = int64(vspFee + 2*txfee)
+	// Below stake validation height vspFee is 0; keep the output above dust
+	// whatever the size estimate gives.
+	a.outputs[0].Value = int64(max(vspFee+2*txfee, txrules.DustThreshold(len(script), relayFee)))
 	err = w.authorTx(ctx, op, a)
 	if err != nil {
 		return nil, err
