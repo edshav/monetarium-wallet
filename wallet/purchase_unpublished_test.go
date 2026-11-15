@@ -52,8 +52,24 @@ func (d *failAddressDB) BeginReadWriteTx() (walletdb.ReadWriteTx, error) {
 	if updateCalledBy(".(*Wallet).purchaseTickets") {
 		d.records++
 	}
-	// The split's record comes first, then the first ticket's.
-	if d.records >= 2 && inCallers(".(*Wallet).persistReturnedChild.func1") {
+	if d.records >= 2 {
+		pcs := make([]uintptr, 64)
+		frames := runtime.CallersFrames(pcs[:runtime.Callers(2, pcs)])
+		for {
+			f, more := frames.Next()
+			if strings.Contains(f.Function, "ersist") || strings.Contains(f.Function, "ddress") {
+				println("FRAME", f.Function)
+			}
+			if !more {
+				break
+			}
+		}
+		println("----")
+	}
+	// The split's record comes first, then the first ticket's.  The
+	// closure persistReturnedChild returns is named by where the
+	// toolchain inlines it ("persistReturnedChild.func1", ".1", ".func13").
+	if d.records >= 2 && inCallersContaining(".(*Wallet).persistReturnedChild.") {
 		return nil, errAddressWrite
 	}
 	return d.DB.BeginReadWriteTx()
@@ -85,6 +101,22 @@ func (l *logLines) String() string {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.b.String()
+}
+
+// inCallersContaining returns whether a function whose name contains s is on
+// the calling goroutine's stack.
+func inCallersContaining(s string) bool {
+	pcs := make([]uintptr, 64)
+	frames := runtime.CallersFrames(pcs[:runtime.Callers(2, pcs)])
+	for {
+		f, more := frames.Next()
+		if strings.Contains(f.Function, s) {
+			return true
+		}
+		if !more {
+			return false
+		}
+	}
 }
 
 // updateCalledBy returns whether the calling goroutine is in walletdb.Update
