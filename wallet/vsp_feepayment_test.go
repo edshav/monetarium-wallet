@@ -1050,10 +1050,11 @@ func TestPurchaseTicketsFeeFailureKeepsHashes(t *testing.T) {
 	checkPurchase(ctx, t, c.wallet, n, resp, 1)
 }
 
-// TestPurchaseTicketsVSPTicketFailureKeepsHashes checks the same when the
-// VSP ticket record cannot be made after publishing: here the wallet is
-// locked once the ticket is published, so its voting key cannot be read.
-func TestPurchaseTicketsVSPTicketFailureKeepsHashes(t *testing.T) {
+// TestPurchaseTicketsLockedAfterPublish checks the same when the wallet is
+// locked once the ticket is published, so the fee step cannot sign.  The
+// ticket still gets a fee job that retries the fee: its VSPTicket, which
+// holds the voting key, was built before publishing.
+func TestPurchaseTicketsLockedAfterPublish(t *testing.T) {
 	ctx := context.Background()
 	c := testVSPClient(ctx, t, vspInfoOr(func(string, []byte) (int, any) {
 		return apiError(types.ErrInternalError)
@@ -1070,6 +1071,12 @@ func TestPurchaseTicketsVSPTicketFailureKeepsHashes(t *testing.T) {
 	checkPurchase(ctx, t, c.wallet, n, resp, 1)
 	if hash := resp.TicketHashes[0].String(); err == nil || !strings.Contains(err.Error(), hash) {
 		t.Errorf("PurchaseTickets error %v: want it to name %s", err, hash)
+	}
+	c.mu.Lock()
+	fp := c.jobs[*resp.TicketHashes[0]]
+	c.mu.Unlock()
+	if fp == nil {
+		t.Errorf("no fee job for ticket %v", resp.TicketHashes[0])
 	}
 }
 

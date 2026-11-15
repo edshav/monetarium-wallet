@@ -12,7 +12,9 @@ import (
 	"maps"
 	"math/big"
 	"net/http"
+	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -29,6 +31,7 @@ import (
 	"github.com/monetarium/monetarium-wallet/wallet/txrules"
 	"github.com/monetarium/monetarium-wallet/wallet/txsizes"
 	"github.com/monetarium/monetarium-wallet/wallet/udb"
+	"github.com/monetarium/monetarium-wallet/wallet/walletdb"
 )
 
 const purchaseVSPFeePercent = 2.0
@@ -775,10 +778,11 @@ func TestPurchaseTicketsVSPQuoteNoTopUp(t *testing.T) {
 	}
 }
 
-// TestPurchaseTicketsNewVSPTicketFails checks that a ticket whose VSP ticket
-// cannot be built after it is published (the wallet is locked by then) has
-// its fee output unlocked.  The VSP is never asked for a fee address.
-func TestPurchaseTicketsNewVSPTicketFails(t *testing.T) {
+// TestPurchaseTicketsLockedAfterPublishFeeOutput checks that a ticket whose
+// fee step cannot sign (the wallet is locked once the ticket is published)
+// has its fee output unlocked and a fee job that retries the fee.  The VSP is
+// never asked for a fee address, as that request is signed.
+func TestPurchaseTicketsLockedAfterPublishFeeOutput(t *testing.T) {
 	ctx := context.Background()
 	p := newPurchaseFixture(ctx, t)
 	p.pastSVH(ctx, t)
@@ -806,10 +810,192 @@ func TestPurchaseTicketsNewVSPTicketFails(t *testing.T) {
 	asked := len(p.feeTickets)
 	p.mu.Unlock()
 	if asked != 0 {
-		t.Fatalf("VSP asked for %d fee addresses, want none: the VSP ticket must fail first", asked)
+		t.Fatalf("VSP asked for %d fee addresses, want none: a locked wallet cannot sign the request", asked)
 	}
 	if locked := lockedNow(p.w); len(locked) != 0 {
 		t.Errorf("outpoints left locked: %v", locked)
+	}
+	p.c.mu.Lock()
+	fp := p.c.jobs[*resp.TicketHashes[0]]
+	p.c.mu.Unlock()
+	if fp == nil {
+		t.Errorf("no fee job for ticket %v", resp.TicketHashes[0])
+	}
+}
+
+// lockedVotingAccount returns a new account of w with its own passphrase,
+// locked, so its private keys cannot be read although w is unlocked.
+func lockedVotingAccount(ctx context.Context, t *testing.T, w *Wallet) uint32 {
+	t.Helper()
+	w.accountGapLimit = 1 // allow one account without history
+	account, err := w.NextAccount(ctx, "voting")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.SetAccountPassphrase(ctx, account, []byte("voting")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.LockAccount(ctx, account); err != nil {
+		t.Fatal(err)
+	}
+	return account
+}
+
+// TestPurchaseTicketsVSPTicketFailsBeforePublish checks that no ticket is
+// published when the VSPTicket of one cannot be built, since no fee job
+// could pay its fee: the voting account is locked, so the voting key the VSP
+// needs cannot be read.  The purchase returns no response and the Locked
+// error without ErrVSPFeeNotPaid, only the split is published, the wallet
+// drops both tickets, and the split's fee outputs are unlocked.
+func TestPurchaseTicketsVSPTicketFailsBeforePublish(t *testing.T) {
+	ctx := context.Background()
+	p := newPurchaseFixture(ctx, t)
+	p.pastSVH(ctx, t)
+	p.fund(ctx, t, true, 1e8)
+	p.setQuote(ctx, t)
+	voting := lockedVotingAccount(ctx, t, p.w)
+	var published []*wire.MsgTx
+	n := publishNetwork{publish: func(tx *wire.MsgTx) { published = append(published, tx) }}
+	p.w.SetNetworkBackend(n)
+
+	resp, err := p.w.PurchaseTickets(ctx, n, &PurchaseTicketsRequest{
+		Count:         2,
+		MinConf:       0,
+		VSPClient:     p.c,
+		VotingAccount: voting,
+	})
+	if resp != nil || !errors.Is(err, errors.Locked) || errors.Is(err, ErrVSPFeeNotPaid) {
+		t.Fatalf("PurchaseTickets: got %+v, %v; want no response and a Locked error without ErrVSPFeeNotPaid", resp, err)
+	}
+	var split *wire.MsgTx
+	for _, tx := range published {
+		switch {
+		case stake.IsSStx(tx):
+			t.Errorf("ticket %v published", tx.TxHash())
+		case split == nil:
+			split = tx
+		case tx.TxHash() != split.TxHash():
+			t.Errorf("published %v besides the split %v", tx.TxHash(), split.TxHash())
+		}
+	}
+	if split == nil {
+		t.Fatal("split not published")
+	}
+	// Two ticket outputs, two fee outputs and change.
+	if len(split.TxOut) != 5 {
+		t.Fatalf("split has %d outputs, want 5: two tickets, two fees, change", len(split.TxOut))
+	}
+	if n := unminedTxs(ctx, t, p.w); n != 1 {
+		t.Errorf("%d unmined txs, want the split alone", n)
+	}
+	if locked := lockedNow(p.w); len(locked) != 0 {
+		t.Errorf("outpoints left locked: %v", locked)
+	}
+	p.mu.Lock()
+	asked := len(p.feeTickets)
+	p.mu.Unlock()
+	if asked != 0 {
+		t.Errorf("VSP asked for %d fee addresses, want none", asked)
+	}
+}
+
+// lockOnKeyReadDB is the wallet's database, which locks w when NewVSPTicket
+// opens a read for the nth voting key.
+type lockOnKeyReadDB struct {
+	walletdb.DB
+	w     *Wallet
+	n     int
+	reads int
+}
+
+func (d *lockOnKeyReadDB) BeginReadTx() (walletdb.ReadTx, error) {
+	if inCallers(".(*Wallet).NewVSPTicket") && inCallers(".(*Wallet).LoadPrivateKey") {
+		d.reads++
+		if d.reads == d.n {
+			d.w.Lock()
+		}
+	}
+	return d.DB.BeginReadTx()
+}
+
+// inCallers returns whether a function whose name ends with suffix is on the
+// calling goroutine's stack.
+func inCallers(suffix string) bool {
+	pcs := make([]uintptr, 64)
+	frames := runtime.CallersFrames(pcs[:runtime.Callers(2, pcs)])
+	for {
+		f, more := frames.Next()
+		if strings.HasSuffix(f.Function, suffix) {
+			return true
+		}
+		if !more {
+			return false
+		}
+	}
+}
+
+// TestPurchaseTicketsSecondVSPTicketFails checks that when the VSPTicket of
+// the second ticket cannot be built (the wallet is locked right before its
+// voting key is read), neither ticket is published and the wallet drops
+// both, including the first, whose VSPTicket was built.
+func TestPurchaseTicketsSecondVSPTicketFails(t *testing.T) {
+	ctx := context.Background()
+	p := newPurchaseFixture(ctx, t)
+	p.pastSVH(ctx, t)
+	p.fund(ctx, t, true, 1e8)
+	p.setQuote(ctx, t)
+	db := &lockOnKeyReadDB{DB: p.w.db, w: p.w, n: 2}
+	p.w.db = db
+	var published []*wire.MsgTx
+	n := publishNetwork{publish: func(tx *wire.MsgTx) { published = append(published, tx) }}
+	p.w.SetNetworkBackend(n)
+
+	resp, err := p.w.PurchaseTickets(ctx, n, &PurchaseTicketsRequest{
+		Count:     2,
+		MinConf:   0,
+		VSPClient: p.c,
+	})
+	if db.reads != 2 {
+		t.Fatalf("%d voting key reads, want 2", db.reads)
+	}
+	if resp != nil || !errors.Is(err, errors.Locked) || errors.Is(err, ErrVSPFeeNotPaid) {
+		t.Fatalf("PurchaseTickets: got %+v, %v; want no response and a Locked error without ErrVSPFeeNotPaid", resp, err)
+	}
+	for _, tx := range published {
+		if stake.IsSStx(tx) {
+			t.Errorf("ticket %v published", tx.TxHash())
+		}
+	}
+	if n := unminedTxs(ctx, t, p.w); n != 1 {
+		t.Errorf("%d unmined txs, want the split alone", n)
+	}
+	if locked := lockedNow(p.w); len(locked) != 0 {
+		t.Errorf("outpoints left locked: %v", locked)
+	}
+}
+
+// TestPurchaseTicketsLockedVotingAccountNoVSP checks that a purchase without
+// a VSP does not read the voting key: from a locked voting account it buys
+// the ticket.
+func TestPurchaseTicketsLockedVotingAccountNoVSP(t *testing.T) {
+	ctx := context.Background()
+	p := newPurchaseFixture(ctx, t)
+	p.pastSVH(ctx, t)
+	p.fund(ctx, t, true, 1e8)
+	voting := lockedVotingAccount(ctx, t, p.w)
+	n := publishNetwork{publish: func(*wire.MsgTx) {}}
+	p.w.SetNetworkBackend(n)
+
+	resp, err := p.w.PurchaseTickets(ctx, n, &PurchaseTicketsRequest{
+		Count:         1,
+		MinConf:       0,
+		VotingAccount: voting,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.TicketHashes) != 1 {
+		t.Fatalf("%d tickets, want 1", len(resp.TicketHashes))
 	}
 }
 
