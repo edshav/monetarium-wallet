@@ -88,6 +88,13 @@ func (f *vspPaymentFixture) fundCoin(ctx context.Context, t *testing.T, mined bo
 		}
 		return tx
 	}
+	f.mine(ctx, t, tx)
+	return tx
+}
+
+// mine connects a block holding txs on top of the fixture's tip.
+func (f *vspPaymentFixture) mine(ctx context.Context, t *testing.T, txs ...*wire.MsgTx) {
+	t.Helper()
 	header := wire.BlockHeader{
 		PrevBlock: f.tip.BlockHash(),
 		Height:    f.tip.Height + 1,
@@ -101,12 +108,11 @@ func (f *vspPaymentFixture) fundCoin(ctx context.Context, t *testing.T, mined bo
 	}
 	hash := header.BlockHash()
 	_, err = f.w.ChainSwitch(ctx, &f.forest, []*BlockNode{NewBlockNode(&header, &hash, filter)},
-		map[chainhash.Hash][]*wire.MsgTx{hash: {tx}})
+		map[chainhash.Hash][]*wire.MsgTx{hash: txs})
 	if err != nil {
 		t.Fatal(err)
 	}
 	f.tip = header
-	return tx
 }
 
 // oneInputMinerFee is the miner fee of a one-input fee tx.

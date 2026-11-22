@@ -86,20 +86,33 @@ func (fp *vspFeePayment) removedExpiredOrSpent() bool {
 	case fp.ticket.Pruned(fp.ctx):
 		// Checked first: the expiry of a ticket the wallet no longer has
 		// cannot be computed.  The VSP record stays: a ticket pruned by
-		// mistake can still be mined, and a later Process call then
-		// resumes its payment.
+		// mistake can still be mined, and a later Process call
+		// (processunmanagedticket) or ProcessManagedTickets (a restart
+		// with VSP sync) then resumes its payment; nothing resumes it by
+		// itself.
 		reason = "pruned"
 	case fp.ticket.Expired(fp.ctx):
 		reason = "expired"
 	case fp.ticket.Spent(fp.ctx):
 		reason = "spent"
 	}
-	if reason != "" {
-		fp.remove(reason)
-		// nothing scheduled
-		return true
+	if reason == "" {
+		return false
 	}
-	return false
+	fp.remove(reason)
+	if reason == "pruned" {
+		// The fee tx spends the split or another output, not the
+		// ticket, so removing the ticket left it holding those inputs.
+		fp.mu.Lock()
+		feeHash, ownHash := fp.feeHash, fp.ownFeeHash
+		fp.mu.Unlock()
+		fp.abandonFeeTx(feeHash)
+		if ownHash != feeHash {
+			fp.abandonFeeTx(ownHash)
+		}
+	}
+	// nothing scheduled
+	return true
 }
 
 // abandonFeeTx abandons the job's unpublished fee tx feeHash, as
@@ -309,7 +322,7 @@ func (fp *vspFeePayment) stop() {
 func (fp *vspFeePayment) receiveFeeAddress() error {
 	ctx := fp.ctx
 
-	// stop processing if ticket is expired or spent
+	// stop processing if ticket is expired, spent or pruned
 	if fp.removedExpiredOrSpent() {
 		// nothing scheduled
 		return errStopped
@@ -653,7 +666,7 @@ func (fp *vspFeePayment) recordReceivedFee() error {
 func (fp *vspFeePayment) submitPayment() (err error) {
 	ctx := fp.ctx
 
-	// stop processing if ticket is expired or spent
+	// stop processing if ticket is expired, spent or pruned
 	if fp.removedExpiredOrSpent() {
 		// nothing scheduled
 		return errStopped
@@ -729,7 +742,7 @@ func (fp *vspFeePayment) submitPayment() (err error) {
 func (fp *vspFeePayment) confirmPayment() (err error) {
 	ctx := fp.ctx
 
-	// stop processing if ticket is expired or spent
+	// stop processing if ticket is expired, spent or pruned
 	if fp.removedExpiredOrSpent() {
 		// nothing scheduled
 		return errStopped
