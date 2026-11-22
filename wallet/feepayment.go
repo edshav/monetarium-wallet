@@ -82,8 +82,9 @@ const (
 
 func (fp *vspFeePayment) removedExpiredOrSpent() bool {
 	var reason string
+	gone, caughtUp := fp.ticketGone()
 	switch {
-	case fp.ticket.Pruned(fp.ctx):
+	case gone:
 		// Checked first: the expiry of a ticket the wallet no longer has
 		// cannot be computed.  The VSP record stays: a ticket pruned by
 		// mistake can still be mined, and a later Process call
@@ -106,13 +107,34 @@ func (fp *vspFeePayment) removedExpiredOrSpent() bool {
 		fp.mu.Lock()
 		feeHash, ownHash := fp.feeHash, fp.ownFeeHash
 		fp.mu.Unlock()
-		fp.abandonFeeTx(feeHash)
+		// While a rescan point remains, a ticket mined meanwhile may
+		// not be recorded yet, and the VSP may hold its fee tx.  The
+		// own fee tx the VSP replaced is not needed either way.
+		if caughtUp {
+			fp.abandonFeeTx(feeHash)
+		}
 		if ownHash != feeHash {
 			fp.abandonFeeTx(ownHash)
 		}
 	}
 	// nothing scheduled
 	return true
+}
+
+// ticketGone reports whether the wallet no longer has the ticket, and
+// whether it has recorded the txs of every main chain block, so that a
+// missing ticket is not one mined meanwhile.  Both come from one view.
+func (fp *vspFeePayment) ticketGone() (gone, caughtUp bool) {
+	w := fp.client.wallet
+	// A view that fails to open leaves both false.
+	_ = walletdb.View(fp.ctx, w.db, func(dbtx walletdb.ReadTx) error {
+		ns := dbtx.ReadBucket(wtxmgrNamespaceKey)
+		gone = !w.txStore.ExistsTx(ns, fp.ticket.Hash())
+		rp, err := w.rescanPoint(dbtx)
+		caughtUp = err == nil && rp == nil
+		return nil
+	})
+	return gone, caughtUp
 }
 
 // abandonFeeTx abandons the job's unpublished fee tx feeHash, as

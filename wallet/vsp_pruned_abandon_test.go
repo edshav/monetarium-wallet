@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -67,6 +68,39 @@ func (f *vspPaymentFixture) mineEmpty(ctx context.Context, t *testing.T, n int) 
 	if _, err := f.w.ChainSwitch(ctx, &f.forest, nodes, nil); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// rescanBetweenReadsDB runs rescan when the pruned check opens a second view
+// of the wallet, as a rescan that finishes between two separate reads would.
+type rescanBetweenReadsDB struct {
+	walletdb.DB
+	views  int
+	rescan func()
+	fail   bool // fail every view the pruned check opens
+}
+
+func (d *rescanBetweenReadsDB) BeginReadTx() (walletdb.ReadTx, error) {
+	pcs := make([]uintptr, 64)
+	frames := runtime.CallersFrames(pcs[:runtime.Callers(2, pcs)])
+	for {
+		f, more := frames.Next()
+		if strings.Contains(f.Function, ".(*vspFeePayment).ticketGone") {
+			if d.fail {
+				return nil, errors.New("view fails")
+			}
+			d.views++
+			if d.views == 2 && d.rescan != nil {
+				rescan := d.rescan
+				d.rescan = nil
+				rescan()
+			}
+			break
+		}
+		if !more {
+			break
+		}
+	}
+	return d.DB.BeginReadTx()
 }
 
 // testJob returns the client's job for ticket.
@@ -127,8 +161,10 @@ func testPaidFee(body []byte) (chainhash.Hash, bool) {
 // published fee tx is kept, and so is one another ticket's record names, and
 // the fee tx of a ticket still in the wallet, expired or spent: only a ticket
 // gone unmined is handled here.  The attempts that check the ticket first
-// abandon it: a scheduled reconcile or confirm, and Process.  The ticket's
-// VSP record stays.
+// abandon it: a scheduled reconcile or confirm, and Process.  While a rescan
+// point remains, as during catch-up, only the own fee tx the VSP replaced is
+// abandoned: the ticket may have been mined in a block not recorded yet.  The
+// job is removed either way, and the ticket's VSP record stays.
 func TestVSPPrunedTicketAbandonsFeeTx(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -138,12 +174,22 @@ func TestVSPPrunedTicketAbandonsFeeTx(t *testing.T) {
 		ownKept     bool
 		vspNamesOwn bool // the VSP holds the job's fee tx
 		published   bool
-		otherTicket bool   // another ticket's record names the fee tx
-		ticket      string // "pruned" (default), "kept", "expired" or "spent"
+		otherTicket bool // another ticket's record names the fee tx
+		// otherNamesOther adds a record of another ticket naming
+		// another fee tx.
+		otherNamesOther bool
+		ticket          string // "pruned" (default), "kept", "expired" or "spent"
 		// attempt is the job's next attempt: "reconcile" (default),
 		// "confirm", or "process", a Process call while the record
 		// reads started.
-		attempt     string
+		attempt string
+		// catchUp leaves a rescan point after the prune: "headers", a
+		// block connected without its txs; "unreadable", a marker
+		// naming an unknown block; "rescan between reads", a rescan
+		// that records the ticket as mined as soon as a second view of
+		// the wallet opens in the pruned check; "view fails", the
+		// pruned check's view of the wallet fails to open.
+		catchUp     string
 		wantUnspent bool
 		// wantSkips counts the hashes abandonFeeTx declines: one the
 		// wallet does not hold, or one it published.
@@ -160,6 +206,19 @@ func TestVSPPrunedTicketAbandonsFeeTx(t *testing.T) {
 			wantUnspent: true},
 		{name: "fee tx published", funding: "separate", published: true, wantSkips: 1},
 		{name: "another ticket names the fee tx", funding: "separate", otherTicket: true, wantSkips: 1},
+		{name: "another ticket names another fee tx", funding: "separate", otherNamesOther: true, wantUnspent: true},
+		{name: "separate output during catch-up", funding: "separate", catchUp: "headers"},
+		{name: "separate output, confirm attempt during catch-up", funding: "separate", attempt: "confirm",
+			catchUp: "headers"},
+		{name: "separate output, Process during catch-up", funding: "separate", attempt: "process",
+			catchUp: "headers"},
+		{name: "job's own fee tx after a failed write, during catch-up", funding: "separate", ownKept: true,
+			catchUp: "headers", wantUnspent: true},
+		{name: "VSP holds the job's fee tx, during catch-up", funding: "separate", ownKept: true, vspNamesOwn: true,
+			catchUp: "headers"},
+		{name: "rescan point unreadable", funding: "separate", catchUp: "unreadable"},
+		{name: "pruned check's view fails", funding: "separate", catchUp: "view fails"},
+		{name: "rescan records the ticket between reads", funding: "separate", catchUp: "rescan between reads"},
 		{name: "ticket still in the wallet", funding: "separate", ticket: "kept"},
 		{name: "ticket expired", funding: "separate", ticket: "expired"},
 		{name: "ticket spent", funding: "separate", ticket: "spent"},
@@ -230,6 +289,9 @@ func TestVSPPrunedTicketAbandonsFeeTx(t *testing.T) {
 					t.Fatal(err)
 				}
 				fp = testJob(c, ticket)
+				if fp == nil {
+					t.Fatal("Process left no job")
+				}
 				fp.stop()
 				feeHash = fp.feeHash
 			default:
@@ -268,6 +330,9 @@ func TestVSPPrunedTicketAbandonsFeeTx(t *testing.T) {
 					// The job a restart makes from the record.
 					fp = c.feePayment(ctx, ticket, true)
 				}
+				if fp == nil {
+					t.Fatal("no job for the ticket")
+				}
 				fp.stop()
 			}
 			if !testHoldsUnmined(ctx, t, w, feeHash) {
@@ -283,6 +348,32 @@ func TestVSPPrunedTicketAbandonsFeeTx(t *testing.T) {
 				if err := other.UpdateFeeStarted(ctx, feeHash, c.URL, c.PubKey); err != nil {
 					t.Fatal(err)
 				}
+				// Records naming another fee tx first and last in key
+				// order, so the naming one is neither, whatever the
+				// tickets' hashes.
+				err := walletdb.Update(ctx, w.db, func(dbtx walletdb.ReadWriteTx) error {
+					first := chainhash.Hash{31: 0x01}
+					last := chainhash.Hash{}
+					for i := range last {
+						last[i] = 0xff
+					}
+					for _, h := range []chainhash.Hash{first, last} {
+						rec := &udb.VSPTicket{FeeHash: chainhash.Hash{0x77}, Host: c.URL, PubKey: c.PubKey}
+						if err := udb.SetVSPTicket(dbtx, &h, rec); err != nil {
+							return err
+						}
+					}
+					return nil
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.otherNamesOther {
+				other := testVSPTicket(ctx, t, c, 3)
+				if err := other.UpdateFeeStarted(ctx, chainhash.Hash{0x77}, c.URL, c.PubKey); err != nil {
+					t.Fatal(err)
+				}
 			}
 
 			switch tc.ticket {
@@ -290,6 +381,43 @@ func TestVSPPrunedTicketAbandonsFeeTx(t *testing.T) {
 				if err := w.AbandonTransaction(ctx, ticket.Hash()); err != nil {
 					t.Fatal(err)
 				}
+				f := &vspPaymentFixture{w: w, cfg: basicWalletConfig,
+					tip: basicWalletConfig.Params.GenesisBlock.Header}
+				switch tc.catchUp {
+				case "headers", "rescan between reads":
+					f.mineEmpty(ctx, t, 1)
+				case "unreadable":
+					// The store's marker key, written directly: its
+					// setter refuses a block it does not know.
+					err := walletdb.Update(ctx, w.db, func(dbtx walletdb.ReadWriteTx) error {
+						unknown := chainhash.Hash{0xbb}
+						return dbtx.ReadWriteBucket(wtxmgrNamespaceKey).Put([]byte("lasttxsblock"), unknown[:])
+					})
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				if tc.catchUp == "view fails" {
+					d := &rescanBetweenReadsDB{DB: w.db, fail: true}
+					w.db = d
+					t.Cleanup(func() { w.db = d.DB })
+				}
+				if tc.catchUp == "rescan between reads" {
+					d := &rescanBetweenReadsDB{DB: w.db}
+					d.rescan = func() {
+						f.mine(ctx, t, ticket.rawTx)
+						err := walletdb.Update(ctx, w.db, func(dbtx walletdb.ReadWriteTx) error {
+							tip, _ := w.txStore.MainChainTip(dbtx)
+							return w.txStore.UpdateProcessedTxsBlockMarker(dbtx, &tip)
+						})
+						if err != nil {
+							t.Error(err)
+						}
+					}
+					w.db = d
+					t.Cleanup(func() { w.db = d.DB })
+				}
+
 			case "expired":
 				f := &vspPaymentFixture{w: w, cfg: basicWalletConfig,
 					tip: basicWalletConfig.Params.GenesisBlock.Header}
@@ -300,6 +428,14 @@ func TestVSPPrunedTicketAbandonsFeeTx(t *testing.T) {
 				f.mineEmpty(ctx, t, int(p.TicketMaturity)+int(p.TicketExpiry)+1)
 				if !ticket.Expired(ctx) || ticket.Pruned(ctx) {
 					t.Fatal("the ticket is not expired")
+				}
+				// As after the rescan of those blocks.
+				err := walletdb.Update(ctx, w.db, func(dbtx walletdb.ReadWriteTx) error {
+					tip, _ := w.txStore.MainChainTip(dbtx)
+					return w.txStore.UpdateProcessedTxsBlockMarker(dbtx, &tip)
+				})
+				if err != nil {
+					t.Fatal(err)
 				}
 			case "spent":
 				// Mined, then spent by an unmined tx.
@@ -322,8 +458,11 @@ func TestVSPPrunedTicketAbandonsFeeTx(t *testing.T) {
 			}
 
 			// The job's next attempt.
+			recBefore, err := ticket.VSPTicketInfo(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
 			skipsBefore := strings.Count(skips.String(), "not abandoning")
-			var err error
 			if tc.attempt == "process" {
 				err = c.Process(ctx, ticket, nil)
 			} else {
@@ -336,8 +475,13 @@ func TestVSPPrunedTicketAbandonsFeeTx(t *testing.T) {
 				fp.procMu.Unlock()
 			}
 			fp.stop()
-			if stopped := tc.ticket != "kept"; stopped != errors.Is(err, errStopped) {
+			// A view that fails leaves the job as if the ticket were there.
+			goesOn := tc.ticket == "kept" || tc.catchUp == "view fails"
+			if stopped := !goesOn; stopped != errors.Is(err, errStopped) {
 				t.Fatalf("attempt: %v; want errStopped %v", err, stopped)
+			}
+			if listed := testJob(c, ticket) != nil; listed != goesOn {
+				t.Fatalf("job listed = %v after the attempt", listed)
 			}
 
 			if n := strings.Count(skips.String(), "not abandoning") - skipsBefore; n != tc.wantSkips {
@@ -353,8 +497,21 @@ func TestVSPPrunedTicketAbandonsFeeTx(t *testing.T) {
 			if after := testSpendable(ctx, t, w); tc.wantUnspent && tc.funding != "split" && after != before {
 				t.Fatalf("spendable balance %v after the abandon, want %v as before the fee tx", after, before)
 			}
-			if _, err := ticket.VSPTicketInfo(ctx); err != nil {
+			rec, err := ticket.VSPTicketInfo(ctx)
+			if err != nil {
 				t.Fatalf("the ticket's VSP record: %v", err)
+			}
+			// The record still names the fee tx, for the pass over VSP
+			// records once the rescan is done.  Process marks it errored
+			// without a fee hash, as on main.
+			if tc.ticket == "" && tc.catchUp != "view fails" {
+				want := recBefore.FeeHash
+				if tc.attempt == "process" {
+					want = chainhash.Hash{}
+				}
+				if rec.FeeHash != want {
+					t.Fatalf("record names %v, want %v", rec.FeeHash, want)
+				}
 			}
 		})
 	}
@@ -362,20 +519,39 @@ func TestVSPPrunedTicketAbandonsFeeTx(t *testing.T) {
 
 // TestVSPTicketPrunedMidAttemptAbandonsFeeTx checks a ticket pruned while an
 // attempt waits for the VSP's fee quote: the attempt makes the fee tx, and
-// submitPayment's check abandons it before paying, through Process and
-// through a scheduled reconcile.
+// submitPayment's check stops it before paying, through Process and through a
+// scheduled reconcile.  The fee tx is abandoned, or kept while a rescan point
+// remains.
 func TestVSPTicketPrunedMidAttemptAbandonsFeeTx(t *testing.T) {
-	for _, via := range []string{"Process", "reconcile"} {
-		t.Run(via, func(t *testing.T) {
+	for _, tc := range []struct {
+		via     string
+		catchUp bool
+	}{
+		{via: "Process"},
+		{via: "reconcile"},
+		{via: "Process", catchUp: true},
+		{via: "reconcile", catchUp: true},
+	} {
+		via := tc.via
+		name := via
+		if tc.catchUp {
+			name += " during catch-up"
+		}
+		t.Run(name, func(t *testing.T) {
 			ctx := context.Background()
 			var ticket *VSPTicket
 			var c *VSPClient
+			var f *vspPaymentFixture
 			var payfee atomic.Bool
 			c = testVSPClient(ctx, t, func(path string, body []byte) (int, any) {
 				switch path {
 				case "/api/v3/feeaddress":
 					if err := c.wallet.AbandonTransaction(ctx, ticket.Hash()); err != nil {
 						t.Error(err)
+					}
+					if tc.catchUp {
+						// A block connected without its txs.
+						f.mineEmpty(ctx, t, 1)
 					}
 					return testFeeAddressReply(ticket, body)
 				case "/api/v3/payfee":
@@ -386,7 +562,7 @@ func TestVSPTicketPrunedMidAttemptAbandonsFeeTx(t *testing.T) {
 			})
 			w := c.wallet
 			// Coin selection takes only mined outputs.
-			f := &vspPaymentFixture{w: w, cfg: basicWalletConfig,
+			f = &vspPaymentFixture{w: w, cfg: basicWalletConfig,
 				tip: basicWalletConfig.Params.GenesisBlock.Header}
 			op := wire.OutPoint{Hash: f.fund(ctx, t, true, 1e8).TxHash()}
 			ticket = testVSPTicket(ctx, t, c, 1)
@@ -411,9 +587,10 @@ func TestVSPTicketPrunedMidAttemptAbandonsFeeTx(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if payfee.Load() || testHoldsUnmined(ctx, t, w, info.FeeHash) || !testUnspentOutputs(ctx, t, w)[op] {
-				t.Fatalf("paid %v; wallet holds the fee tx %v; want neither, and its input unspent",
-					payfee.Load(), testHoldsUnmined(ctx, t, w, info.FeeHash))
+			held := testHoldsUnmined(ctx, t, w, info.FeeHash)
+			if payfee.Load() || held != tc.catchUp || testUnspentOutputs(ctx, t, w)[op] == tc.catchUp {
+				t.Fatalf("paid %v; wallet holds the fee tx %v; want no payment, and the fee tx held = %v",
+					payfee.Load(), held, tc.catchUp)
 			}
 		})
 	}
