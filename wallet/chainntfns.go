@@ -245,6 +245,16 @@ func (w *Wallet) ChainSwitch(ctx context.Context, forest *SidechainForest, chain
 			log.Errorf("Failed to prune unmined transactions when "+
 				"connecting block height %v: %v", tip.Header.Height, err)
 		}
+		// Only once every main chain block's txs are recorded: until then
+		// a ticket mined meanwhile may be missing, as for an SSFee.
+		if pruneSSFee {
+			abandoned, err := w.abandonOrphanFeeTxs(dbtx)
+			if err != nil {
+				log.Errorf("Failed to abandon the fee txs of VSP tickets "+
+					"the wallet no longer has: %v", err)
+			}
+			hashes = append(hashes, abandoned...)
+		}
 
 		for _, hash := range hashes {
 			w.NtfnServer.notifyRemovedTransaction(*hash)

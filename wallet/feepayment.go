@@ -20,6 +20,7 @@ import (
 	"github.com/monetarium/monetarium-node/txscript/stdaddr"
 	"github.com/monetarium/monetarium-node/wire"
 	"github.com/decred/vspd/types/v3"
+	werrors "github.com/monetarium/monetarium-wallet/errors"
 	"github.com/monetarium/monetarium-wallet/wallet/udb"
 	"github.com/monetarium/monetarium-wallet/wallet/walletdb"
 )
@@ -181,6 +182,12 @@ func (c *VSPClient) abandonFeeTx(ctx context.Context, ticket *VSPTicket, feeHash
 		return
 	}
 	err = w.AbandonTransaction(ctx, &feeHash)
+	if errors.Is(err, werrors.NotExist) {
+		// Removed meanwhile, as by the pass over VSP ticket records
+		// when a block connects.
+		c.log.Debugf("Ticket %v: fee tx %v already removed", ticket, feeHash)
+		return
+	}
 	if err != nil {
 		c.log.Errorf("Ticket %v: abandon fee tx %v: %v", ticket, feeHash, err)
 		return
