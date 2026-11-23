@@ -95,6 +95,13 @@ func testVSPTicket(ctx context.Context, t *testing.T, c *VSPClient, id byte) *VS
 // testVSPTicketSpending is testVSPTicket for a ticket that spends in.
 func testVSPTicketSpending(ctx context.Context, t *testing.T, c *VSPClient, in wire.OutPoint) *VSPTicket {
 	t.Helper()
+	return testVSPTicketExpiring(ctx, t, c, in, wire.NoExpiryValue)
+}
+
+// testVSPTicketExpiring is testVSPTicketSpending for a ticket tx with the
+// given expiry height.
+func testVSPTicketExpiring(ctx context.Context, t *testing.T, c *VSPClient, in wire.OutPoint, expiry uint32) *VSPTicket {
+	t.Helper()
 
 	addr, err := c.wallet.NewExternalAddress(ctx, 0)
 	if err != nil {
@@ -107,6 +114,7 @@ func testVSPTicketSpending(ctx context.Context, t *testing.T, c *VSPClient, in w
 
 	const price = 1e8
 	tx := wire.NewMsgTx()
+	tx.Expiry = expiry
 	tx.AddTxIn(wire.NewTxIn(&in, price, nil))
 	ver, script := stakeAddr.VotingRightsScript()
 	tx.AddTxOut(&wire.TxOut{Value: price, Version: ver, PkScript: script})

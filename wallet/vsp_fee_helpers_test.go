@@ -27,3 +27,28 @@ func timerSet(fp *vspFeePayment) bool {
 	defer fp.timerMu.Unlock()
 	return fp.timer != nil
 }
+
+// testTakeScheduled stops fp's timer and returns the task it was set to run,
+// which runs the attempt as the timer would and returns its error.
+func testTakeScheduled(t *testing.T, fp *vspFeePayment) func() error {
+	t.Helper()
+	fp.timerMu.Lock()
+	task := fp.timerTask
+	fp.timerMu.Unlock()
+	if task == nil {
+		t.Fatal("no attempt scheduled")
+	}
+	fp.stop()
+	return func() error {
+		task()
+		fp.mu.Lock()
+		defer fp.mu.Unlock()
+		return fp.err
+	}
+}
+
+// testRunScheduled runs fp's scheduled attempt in its timer's place.
+func testRunScheduled(t *testing.T, fp *vspFeePayment) error {
+	t.Helper()
+	return testTakeScheduled(t, fp)()
+}

@@ -110,6 +110,10 @@ func (v *VSPTicket) Expired(ctx context.Context) bool {
 // height and expiry height fields. Should be called with mutex already held.
 func (v *VSPTicket) calcHeights(ctx context.Context) {
 	minedHeight, err := v.TxBlock(ctx)
+	if errors.Is(err, errors.NotExist) {
+		// Pruned, or not recorded yet while the wallet catches up.
+		return
+	}
 	if err != nil {
 		// This is not expected to ever error, as the ticket has already been
 		// fetched from the wallet at least one before this point is reached.

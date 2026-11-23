@@ -103,6 +103,17 @@ func (d *rescanBetweenReadsDB) BeginReadTx() (walletdb.ReadTx, error) {
 	return d.DB.BeginReadTx()
 }
 
+// testLastScheduled returns the name in the last "Scheduling" line of logs.
+func testLastScheduled(logs *vspLogLines) string {
+	out := logs.String()
+	i := strings.LastIndex(out, "Scheduling \"")
+	if i < 0 {
+		return ""
+	}
+	out = out[i+len("Scheduling \""):]
+	return "Scheduling " + out[:strings.IndexByte(out, '"')]
+}
+
 // testJob returns the client's job for ticket.
 func testJob(c *VSPClient, ticket *VSPTicket) *vspFeePayment {
 	c.mu.Lock()
@@ -162,9 +173,10 @@ func testPaidFee(body []byte) (chainhash.Hash, bool) {
 // the fee tx of a ticket still in the wallet, expired or spent: only a ticket
 // gone unmined is handled here.  The attempts that check the ticket first
 // abandon it: a scheduled reconcile or confirm, and Process.  While a rescan
-// point remains, as during catch-up, only the own fee tx the VSP replaced is
-// abandoned: the ticket may have been mined in a block not recorded yet.  The
-// job is removed either way, and the ticket's VSP record stays.
+// point remains, as during catch-up, the ticket may have been mined in a block
+// not recorded yet: the attempt waits, sends nothing to the VSP and keeps the
+// job, the fee tx and the record, and only the own fee tx the VSP replaced is
+// abandoned.  Otherwise the job is removed, and the ticket's VSP record stays.
 func TestVSPPrunedTicketAbandonsFeeTx(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -227,7 +239,9 @@ func TestVSPPrunedTicketAbandonsFeeTx(t *testing.T) {
 			ctx := context.Background()
 			var ticket *VSPTicket
 			vspHash := chainhash.Hash{0xfe}
+			var requests atomic.Int32
 			c := testVSPClient(ctx, t, func(path string, body []byte) (int, any) {
+				requests.Add(1)
 				// failVSPWrites lengthens the URL's path.
 				switch path[strings.Index(path, "/api/v3/"):] {
 				case "/api/v3/feeaddress":
@@ -249,6 +263,7 @@ func TestVSPPrunedTicketAbandonsFeeTx(t *testing.T) {
 			w := c.wallet
 			skips := &vspLogLines{}
 			c.log = slog.NewBackend(skips).Logger("VSP")
+			c.log.SetLevel(slog.LevelDebug)
 
 			// op is the output the fee tx spends.
 			var op *wire.OutPoint
@@ -463,6 +478,10 @@ func TestVSPPrunedTicketAbandonsFeeTx(t *testing.T) {
 				t.Fatal(err)
 			}
 			skipsBefore := strings.Count(skips.String(), "not abandoning")
+			requestsBefore := requests.Load()
+			fp.mu.Lock()
+			ownBefore, feeBefore := fp.ownFeeHash, fp.feeHash
+			fp.mu.Unlock()
 			if tc.attempt == "process" {
 				err = c.Process(ctx, ticket, nil)
 			} else {
@@ -474,13 +493,41 @@ func TestVSPPrunedTicketAbandonsFeeTx(t *testing.T) {
 				err = next()
 				fp.procMu.Unlock()
 			}
-			fp.stop()
 			// A view that fails leaves the job as if the ticket were there.
 			goesOn := tc.ticket == "kept" || tc.catchUp == "view fails"
-			if stopped := !goesOn; stopped != errors.Is(err, errStopped) {
+			delayed := tc.ticket == "" && tc.catchUp != "" && tc.catchUp != "view fails"
+			if delayed {
+				// The replaced own fee tx is abandoned once; one the VSP
+				// holds stays the job's.
+				fp.mu.Lock()
+				own := fp.ownFeeHash
+				fp.mu.Unlock()
+				want := chainhash.Hash{}
+				if ownBefore == feeBefore {
+					want = ownBefore
+				}
+				if own != want {
+					t.Fatalf("job keeps own fee tx %v, want %v", own, want)
+				}
+				next := "reconcile payment"
+				if tc.attempt == "confirm" {
+					next = "confirm payment"
+				}
+				if !timerSet(fp) || !strings.HasSuffix(testLastScheduled(skips), next) {
+					t.Fatalf("scheduled %q, timer set %v; want %q", testLastScheduled(skips), timerSet(fp), next)
+				}
+				if n := requests.Load() - requestsBefore; n != 0 {
+					t.Fatalf("%d VSP requests while the wallet catches up", n)
+				}
+			}
+			fp.stop()
+			if stopped := !goesOn && !delayed; stopped != errors.Is(err, errStopped) {
 				t.Fatalf("attempt: %v; want errStopped %v", err, stopped)
 			}
-			if listed := testJob(c, ticket) != nil; listed != goesOn {
+			if delayed != errors.Is(err, errCatchingUp) {
+				t.Fatalf("attempt: %v; want errCatchingUp %v", err, delayed)
+			}
+			if listed := testJob(c, ticket) != nil; listed != (goesOn || delayed) {
 				t.Fatalf("job listed = %v after the attempt", listed)
 			}
 
@@ -501,12 +548,12 @@ func TestVSPPrunedTicketAbandonsFeeTx(t *testing.T) {
 			if err != nil {
 				t.Fatalf("the ticket's VSP record: %v", err)
 			}
-			// The record still names the fee tx, for the pass over VSP
-			// records once the rescan is done.  Process marks it errored
-			// without a fee hash, as on main.
+			// The record still names the fee tx, for the attempt after the
+			// rescan.  Process marks it errored without a fee hash, as on
+			// main, once the ticket is found gone.
 			if tc.ticket == "" && tc.catchUp != "view fails" {
 				want := recBefore.FeeHash
-				if tc.attempt == "process" {
+				if tc.attempt == "process" && !delayed {
 					want = chainhash.Hash{}
 				}
 				if rec.FeeHash != want {
@@ -520,8 +567,8 @@ func TestVSPPrunedTicketAbandonsFeeTx(t *testing.T) {
 // TestVSPTicketPrunedMidAttemptAbandonsFeeTx checks a ticket pruned while an
 // attempt waits for the VSP's fee quote: the attempt makes the fee tx, and
 // submitPayment's check stops it before paying, through Process and through a
-// scheduled reconcile.  The fee tx is abandoned, or kept while a rescan point
-// remains.
+// scheduled reconcile.  The fee tx is abandoned and the job removed, or, while a
+// rescan point remains, both are kept and the record still names the fee tx.
 func TestVSPTicketPrunedMidAttemptAbandonsFeeTx(t *testing.T) {
 	for _, tc := range []struct {
 		via     string
@@ -561,6 +608,9 @@ func TestVSPTicketPrunedMidAttemptAbandonsFeeTx(t *testing.T) {
 				return apiError(types.ErrInternalError)
 			})
 			w := c.wallet
+			logs := &vspLogLines{}
+			c.log = slog.NewBackend(logs).Logger("VSP")
+			c.log.SetLevel(slog.LevelDebug)
 			// Coin selection takes only mined outputs.
 			f = &vspPaymentFixture{w: w, cfg: basicWalletConfig,
 				tip: basicWalletConfig.Params.GenesisBlock.Header}
@@ -577,20 +627,65 @@ func TestVSPTicketPrunedMidAttemptAbandonsFeeTx(t *testing.T) {
 				err = fp.reconcilePayment()
 				fp.procMu.Unlock()
 			}
-			if !errors.Is(err, errStopped) {
-				t.Fatalf("attempt: %v; want errStopped", err)
+			want := errStopped
+			if tc.catchUp {
+				want = errCatchingUp
 			}
-			if fp := testJob(c, ticket); fp != nil {
-				t.Fatal("the job is still listed")
+			if !errors.Is(err, want) {
+				t.Fatalf("attempt: %v; want %v", err, want)
+			}
+			// While the wallet catches up the job waits for the rescan.
+			fp := testJob(c, ticket)
+			if (fp != nil) != tc.catchUp {
+				t.Fatalf("job listed = %v", fp != nil)
+			}
+			var retry func() error
+			if fp != nil {
+				if got := testLastScheduled(logs); got != "Scheduling reconcile payment" || !timerSet(fp) {
+					t.Fatalf("%q, timer set %v; want the reconcile scheduled", got, timerSet(fp))
+				}
+				retry = testTakeScheduled(t, fp)
 			}
 			info, err := ticket.VSPTicketInfo(ctx)
 			if err != nil {
 				t.Fatal(err)
 			}
+			if tc.catchUp && info.FeeHash == (chainhash.Hash{}) {
+				t.Fatal("the record names no fee tx")
+			}
 			held := testHoldsUnmined(ctx, t, w, info.FeeHash)
 			if payfee.Load() || held != tc.catchUp || testUnspentOutputs(ctx, t, w)[op] == tc.catchUp {
 				t.Fatalf("paid %v; wallet holds the fee tx %v; want no payment, and the fee tx held = %v",
 					payfee.Load(), held, tc.catchUp)
+			}
+
+			if !tc.catchUp {
+				return
+			}
+			// The rescan records the ticket as mined; the scheduled
+			// reconcile pays the fee tx the attempt made.
+			f.mine(ctx, t, ticket.rawTx)
+			err = walletdb.Update(ctx, w.db, func(dbtx walletdb.ReadWriteTx) error {
+				tip, _ := w.txStore.MainChainTip(dbtx)
+				return w.txStore.UpdateProcessedTxsBlockMarker(dbtx, &tip)
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = retry()
+			// Paid: the job goes on to confirm the fee.
+			if got := testLastScheduled(logs); got != "Scheduling confirm payment" || !timerSet(fp) {
+				t.Errorf("after paying: %q, timer set %v; want the confirm scheduled", got, timerSet(fp))
+			}
+			fp.stop()
+			after, infoErr := ticket.VSPTicketInfo(ctx)
+			if infoErr != nil {
+				t.Fatal(infoErr)
+			}
+			if !payfee.Load() || after.FeeHash != info.FeeHash ||
+				after.FeeTxStatus != uint32(udb.VSPFeeProcessPaid) {
+				t.Fatalf("after the rescan: %v; paid %v, record %+v, want paid with %v",
+					err, payfee.Load(), after, info.FeeHash)
 			}
 		})
 	}

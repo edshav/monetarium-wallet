@@ -330,7 +330,10 @@ func TestVSPAbandonFeeTxRemovedMeanwhile(t *testing.T) {
 			w.db = d
 			t.Cleanup(func() { w.db = d.DB })
 
-			c.abandonFeeTx(ctx, ticket, feeHash)
+			// Settled when the tx is gone; a failed abandon is not.
+			if settled := c.abandonFeeTx(ctx, ticket, feeHash); settled == mined {
+				t.Fatalf("settled = %v", settled)
+			}
 			if d.remove != nil || testHoldsUnmined(ctx, t, w, feeHash) {
 				t.Fatal("the fee tx did not change meanwhile")
 			}
