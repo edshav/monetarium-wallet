@@ -238,8 +238,9 @@ func TestVSPExpiredFeeMarksErrored(t *testing.T) {
 }
 
 // walletFundedFeeTx returns an unsigned fee tx with one input, an output the
-// wallet holds, for makeFeeTx to finish.
-func walletFundedFeeTx(ctx context.Context, t *testing.T, w *Wallet) *wire.MsgTx {
+// wallet holds, for makeFeeTx to finish.  id tells apart the funding txs of
+// several fee txs in one wallet.
+func walletFundedFeeTx(ctx context.Context, t *testing.T, w *Wallet, id byte) *wire.MsgTx {
 	t.Helper()
 	addr, err := w.NewInternalAddress(ctx, 0)
 	if err != nil {
@@ -247,7 +248,7 @@ func walletFundedFeeTx(ctx context.Context, t *testing.T, w *Wallet) *wire.MsgTx
 	}
 	ver, script := addr.(Address).PaymentScript()
 	fund := wire.NewMsgTx()
-	fund.AddTxIn(wire.NewTxIn(&wire.OutPoint{Hash: chainhash.Hash{2}}, 1e8, nil))
+	fund.AddTxIn(wire.NewTxIn(&wire.OutPoint{Hash: chainhash.Hash{2, id}}, 1e8, nil))
 	fund.AddTxOut(&wire.TxOut{Value: 1e8, Version: ver, PkScript: script})
 	if err := w.AddTransaction(ctx, fund, nil); err != nil {
 		t.Fatal(err)
@@ -267,7 +268,7 @@ func TestVSPRejectedNewFeeTxIsAbandoned(t *testing.T) {
 	})
 	w := c.wallet
 	ticket := testVSPTicket(ctx, t, c, 1)
-	feeTx := walletFundedFeeTx(ctx, t, w)
+	feeTx := walletFundedFeeTx(ctx, t, w, 0)
 	fp := &vspFeePayment{
 		client:  c,
 		ctx:     ctx,
@@ -418,7 +419,7 @@ func TestVSPFailedPaidWriteAbandonsFeeTx(t *testing.T) {
 	})
 	w := c.wallet
 	ticket := testVSPTicket(ctx, t, c, 1)
-	feeTx := walletFundedFeeTx(ctx, t, w)
+	feeTx := walletFundedFeeTx(ctx, t, w, 0)
 	failVSPWrites(c)
 	fp := &vspFeePayment{
 		client:  c,
@@ -523,17 +524,28 @@ func TestVSPProcessManagedTicketsSkipsBadTicket(t *testing.T) {
 // mutex.
 func waitBlockedOnMutex(t *testing.T, fn string) {
 	t.Helper()
+	waitBlockedOnMutexN(t, fn, 1)
+}
+
+// waitBlockedOnMutexN returns once n goroutines running fn wait to lock a
+// mutex.
+func waitBlockedOnMutexN(t *testing.T, fn string, n int) {
+	t.Helper()
 	buf := make([]byte, 1<<20)
 	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); {
-		n := runtime.Stack(buf, true)
-		for _, g := range strings.Split(string(buf[:n]), "\n\n") {
+		size := runtime.Stack(buf, true)
+		blocked := 0
+		for _, g := range strings.Split(string(buf[:size]), "\n\n") {
 			if strings.Contains(g, "[sync.Mutex.Lock") && strings.Contains(g, fn) {
-				return
+				blocked++
 			}
+		}
+		if blocked >= n {
+			return
 		}
 		runtime.Gosched()
 	}
-	t.Fatalf("no goroutine in %s waited for a mutex", fn)
+	t.Fatalf("fewer than %d goroutines in %s waited for a mutex", n, fn)
 }
 
 // TestVSPFeeWorkHoldsProcessingLock checks that Process and a scheduled

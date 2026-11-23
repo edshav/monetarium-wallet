@@ -298,6 +298,13 @@ func (c *VSPClient) Process(ctx context.Context, ticket *VSPTicket, feeTx *wire.
 		startHash := fp.feeHash
 		fp.mu.Unlock()
 		fp.procMu.Lock()
+		if !fp.listed() {
+			// A scheduled attempt removed this job while Process waited
+			// for it.  Start over with the ticket's current job and
+			// status rather than pay a second fee from the removed job.
+			fp.procMu.Unlock()
+			return c.Process(ctx, ticket, feeTx)
+		}
 		defer fp.procMu.Unlock()
 		fp.mu.Lock()
 		if fp.feeTx == nil {
@@ -347,6 +354,11 @@ func (c *VSPClient) Process(ctx context.Context, ticket *VSPTicket, feeTx *wire.
 		}
 
 		fp.procMu.Lock()
+		if !fp.listed() {
+			// Removed while Process waited, as above.
+			fp.procMu.Unlock()
+			return c.Process(ctx, ticket, feeTx)
+		}
 		defer fp.procMu.Unlock()
 		return fp.confirmPayment()
 	case udb.VSPFeeProcessConfirmed:
