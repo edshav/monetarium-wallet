@@ -89,6 +89,12 @@ func testVSPClient(ctx context.Context, t *testing.T, reply func(path string, bo
 // requests about it can be signed. id makes each ticket distinct.
 func testVSPTicket(ctx context.Context, t *testing.T, c *VSPClient, id byte) *VSPTicket {
 	t.Helper()
+	return testVSPTicketSpending(ctx, t, c, wire.OutPoint{Hash: chainhash.Hash{id}})
+}
+
+// testVSPTicketSpending is testVSPTicket for a ticket that spends in.
+func testVSPTicketSpending(ctx context.Context, t *testing.T, c *VSPClient, in wire.OutPoint) *VSPTicket {
+	t.Helper()
 
 	addr, err := c.wallet.NewExternalAddress(ctx, 0)
 	if err != nil {
@@ -101,7 +107,7 @@ func testVSPTicket(ctx context.Context, t *testing.T, c *VSPClient, id byte) *VS
 
 	const price = 1e8
 	tx := wire.NewMsgTx()
-	tx.AddTxIn(wire.NewTxIn(&wire.OutPoint{Hash: chainhash.Hash{id}}, price, nil))
+	tx.AddTxIn(wire.NewTxIn(&in, price, nil))
 	ver, script := stakeAddr.VotingRightsScript()
 	tx.AddTxOut(&wire.TxOut{Value: price, Version: ver, PkScript: script})
 	ver, script = stakeAddr.RewardCommitmentScript(price, 0, 0)
