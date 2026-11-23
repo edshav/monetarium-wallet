@@ -187,7 +187,7 @@ func (c *VSPClient) ProcessUnprocessedTickets(ctx context.Context, tickets []*VS
 		go func(t *VSPTicket) {
 			defer wg.Done()
 			err := c.Process(ctx, t, nil)
-			if err != nil && !errors.Is(err, errStopped) {
+			if err != nil && !errors.Is(err, errStopped) && !errors.Is(err, errCatchingUp) {
 				c.log.Error(err)
 			}
 		}(ticket)
@@ -295,7 +295,10 @@ func (c *VSPClient) ProcessManagedTickets(ctx context.Context, tickets []*VSPTic
 // fee tx fails, the caller should unlock the inputs of feeTx, and the fee
 // payment does not keep it.  If only submitting it fails, the wallet keeps the
 // fee tx and the fee payment retries it.  If the VSP already holds a fee tx for
-// the ticket, that one is recorded and confirmed, and feeTx is left unused.
+// the ticket, that one is recorded and confirmed, and feeTx is left unused.  If
+// the ticket is missing while the wallet catches up, Process returns
+// errCatchingUp: the fee payment keeps any fee tx and the record, and retries
+// once the rescan is done.
 func (c *VSPClient) Process(ctx context.Context, ticket *VSPTicket, feeTx *wire.MsgTx) error {
 	vspTicket, err := ticket.VSPTicketInfo(ctx)
 	if err != nil && !errors.Is(err, errors.NotExist) {
@@ -357,7 +360,9 @@ func (c *VSPClient) Process(ctx context.Context, ticket *VSPTicket, feeTx *wire.
 				fp.feeTx = nil
 			}
 			fp.mu.Unlock()
-			if madeMeanwhile {
+			// A wait for the rescan keeps the record: its fee tx may be
+			// the one the VSP holds for a ticket mined meanwhile.
+			if madeMeanwhile || errors.Is(feeErr, errCatchingUp) {
 				return feeErr
 			}
 			if markErr := ticket.UpdateFeeErrored(ctx, c.Client.URL, c.Client.PubKey); markErr != nil {

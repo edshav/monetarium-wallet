@@ -27,6 +27,7 @@ import (
 
 var (
 	errStopped    = errors.New("fee processing stopped")
+	errCatchingUp = errors.New("ticket not in the wallet while it catches up; retrying later")
 	errFeeTooHigh = errors.New("server fee amount too high")
 )
 
@@ -67,6 +68,8 @@ type vspFeePayment struct {
 
 	timerMu sync.Mutex
 	timer   *time.Timer
+	// timerTask is what timer runs; tests run it in the timer's place.
+	timerTask func()
 
 	params *chaincfg.Params
 }
@@ -81,45 +84,56 @@ const (
 	TicketSpent
 )
 
-func (fp *vspFeePayment) removedExpiredOrSpent() bool {
-	var reason string
+func (fp *vspFeePayment) removedExpiredOrSpent(retryName string, retry func() error) error {
 	gone, caughtUp := fp.ticketGone()
-	switch {
-	case gone:
+	if gone {
+		// The fee tx spends the split or another output, not the
+		// ticket, so it still holds those inputs.  The own fee tx the
+		// VSP replaced is not needed either way, and only this job knows
+		// it: a restart before a later attempt would leave it holding
+		// its inputs.
+		fp.mu.Lock()
+		feeHash, ownHash := fp.feeHash, fp.ownFeeHash
+		fp.mu.Unlock()
+		// During catch-up a failed read or write keeps it for the next
+		// attempt; once caught up the job is removed below either way.
+		if ownHash != feeHash && fp.abandonFeeTx(ownHash) {
+			fp.mu.Lock()
+			fp.ownFeeHash = chainhash.Hash{}
+			fp.mu.Unlock()
+		}
+		if !caughtUp {
+			// While a rescan point remains, a ticket mined in a block
+			// the rescan has not recorded yet is missing too.  The
+			// attempt waits, with nothing sent to the VSP, and the
+			// first one after the rescan decides.
+			fp.schedule(retryName, retry)
+			return errCatchingUp
+		}
 		// Checked first: the expiry of a ticket the wallet no longer has
 		// cannot be computed.  The VSP record stays: a ticket pruned by
 		// mistake can still be mined, and a later Process call
 		// (processunmanagedticket) or ProcessManagedTickets (a restart
 		// with VSP sync) then resumes its payment; nothing resumes it by
 		// itself.
-		reason = "pruned"
+		fp.remove("pruned")
+		fp.abandonFeeTx(feeHash)
+		// nothing scheduled
+		return errStopped
+	}
+	var reason string
+	switch {
 	case fp.ticket.Expired(fp.ctx):
 		reason = "expired"
 	case fp.ticket.Spent(fp.ctx):
 		reason = "spent"
 	}
 	if reason == "" {
-		return false
+		return nil
 	}
 	fp.remove(reason)
-	if reason == "pruned" {
-		// The fee tx spends the split or another output, not the
-		// ticket, so removing the ticket left it holding those inputs.
-		fp.mu.Lock()
-		feeHash, ownHash := fp.feeHash, fp.ownFeeHash
-		fp.mu.Unlock()
-		// While a rescan point remains, a ticket mined meanwhile may
-		// not be recorded yet, and the VSP may hold its fee tx.  The
-		// own fee tx the VSP replaced is not needed either way.
-		if caughtUp {
-			fp.abandonFeeTx(feeHash)
-		}
-		if ownHash != feeHash {
-			fp.abandonFeeTx(ownHash)
-		}
-	}
 	// nothing scheduled
-	return true
+	return errStopped
 }
 
 // ticketGone reports whether the wallet no longer has the ticket, and
@@ -140,8 +154,8 @@ func (fp *vspFeePayment) ticketGone() (gone, caughtUp bool) {
 
 // abandonFeeTx abandons the job's unpublished fee tx feeHash, as
 // VSPClient.abandonFeeTx does.
-func (fp *vspFeePayment) abandonFeeTx(feeHash chainhash.Hash) {
-	fp.client.abandonFeeTx(fp.ctx, fp.ticket, feeHash)
+func (fp *vspFeePayment) abandonFeeTx(feeHash chainhash.Hash) bool {
+	return fp.client.abandonFeeTx(fp.ctx, fp.ticket, feeHash)
 }
 
 // abandonFeeTx removes the ticket's unpublished fee tx feeHash from the wallet
@@ -149,9 +163,9 @@ func (fp *vspFeePayment) abandonFeeTx(feeHash chainhash.Hash) {
 // alone: the hash may come from the VSP, and a tx the network may have must
 // not be forgotten.  So is one another ticket's record names: a hash the VSP
 // named may be the fee tx of another of the wallet's tickets.
-func (c *VSPClient) abandonFeeTx(ctx context.Context, ticket *VSPTicket, feeHash chainhash.Hash) {
+func (c *VSPClient) abandonFeeTx(ctx context.Context, ticket *VSPTicket, feeHash chainhash.Hash) (settled bool) {
 	if feeHash == (chainhash.Hash{}) {
-		return
+		return true
 	}
 	w := c.wallet
 	var unpublished, otherTicket bool
@@ -179,20 +193,21 @@ func (c *VSPClient) abandonFeeTx(ctx context.Context, ticket *VSPTicket, feeHash
 	if err != nil || !unpublished || otherTicket {
 		c.log.Warnf("Ticket %v: not abandoning fee tx %v: unpublished %v, "+
 			"another ticket's %v, err %v", ticket, feeHash, unpublished, otherTicket, err)
-		return
+		return err == nil
 	}
 	err = w.AbandonTransaction(ctx, &feeHash)
 	if errors.Is(err, werrors.NotExist) {
 		// Removed meanwhile, as by the pass over VSP ticket records
 		// when a block connects.
 		c.log.Debugf("Ticket %v: fee tx %v already removed", ticket, feeHash)
-		return
+		return true
 	}
 	if err != nil {
 		c.log.Errorf("Ticket %v: abandon fee tx %v: %v", ticket, feeHash, err)
-		return
+		return false
 	}
 	c.log.Infof("Ticket %v: abandoned fee tx %v", ticket, feeHash)
+	return true
 }
 
 func (fp *vspFeePayment) remove(reason string) {
@@ -312,10 +327,12 @@ func (fp *vspFeePayment) schedule(name string, method func() error) {
 	if fp.timer != nil {
 		fp.timer.Stop()
 		fp.timer = nil
+		fp.timerTask = nil
 	}
 	if method != nil {
 		fp.client.log.Debugf("Scheduling %q for ticket %s in %v", name, fp.ticket, delay)
-		fp.timer = time.AfterFunc(delay, fp.task(name, method))
+		fp.timerTask = fp.task(name, method)
+		fp.timer = time.AfterFunc(delay, fp.timerTask)
 	}
 }
 
@@ -357,7 +374,10 @@ func (fp *vspFeePayment) task(name string, method func() error) func() {
 		fp.mu.Lock()
 		fp.err = err
 		fp.mu.Unlock()
-		if err != nil {
+		switch {
+		case errors.Is(err, errCatchingUp):
+			fp.client.log.Debugf("Ticket %v: %v: %v", fp.ticket, name, err)
+		case err != nil:
 			fp.client.log.Errorf("Ticket %v: %v: %v", fp.ticket, name, err)
 		}
 	}
@@ -370,10 +390,10 @@ func (fp *vspFeePayment) stop() {
 func (fp *vspFeePayment) receiveFeeAddress() error {
 	ctx := fp.ctx
 
-	// stop processing if ticket is expired, spent or pruned
-	if fp.removedExpiredOrSpent() {
-		// nothing scheduled
-		return errStopped
+	// stop processing if ticket is expired, spent or pruned, or wait
+	// for the rescan
+	if err := fp.removedExpiredOrSpent("reconcile payment", fp.reconcilePayment); err != nil {
+		return err
 	}
 
 	// Fetch ticket and its parent transaction (typically, a split
@@ -532,10 +552,10 @@ func (c *VSPClient) setVoteChoices(ctx context.Context, ticket *VSPTicket,
 func (fp *vspFeePayment) reconcilePayment() error {
 	ctx := fp.ctx
 
-	// stop processing if ticket is expired, spent or pruned
-	if fp.removedExpiredOrSpent() {
-		// nothing scheduled
-		return errStopped
+	// stop processing if ticket is expired, spent or pruned, or wait
+	// for the rescan
+	if err := fp.removedExpiredOrSpent("reconcile payment", fp.reconcilePayment); err != nil {
+		return err
 	}
 
 	// A fee amount and address must have been created by this point.
@@ -714,10 +734,10 @@ func (fp *vspFeePayment) recordReceivedFee() error {
 func (fp *vspFeePayment) submitPayment() (err error) {
 	ctx := fp.ctx
 
-	// stop processing if ticket is expired, spent or pruned
-	if fp.removedExpiredOrSpent() {
-		// nothing scheduled
-		return errStopped
+	// stop processing if ticket is expired, spent or pruned, or wait
+	// for the rescan
+	if err := fp.removedExpiredOrSpent("reconcile payment", fp.reconcilePayment); err != nil {
+		return err
 	}
 
 	// submitting a payment requires the fee tx to already be created.
@@ -790,10 +810,10 @@ func (fp *vspFeePayment) submitPayment() (err error) {
 func (fp *vspFeePayment) confirmPayment() (err error) {
 	ctx := fp.ctx
 
-	// stop processing if ticket is expired, spent or pruned
-	if fp.removedExpiredOrSpent() {
-		// nothing scheduled
-		return errStopped
+	// stop processing if ticket is expired, spent or pruned, or wait
+	// for the rescan
+	if err := fp.removedExpiredOrSpent("confirm payment", fp.confirmPayment); err != nil {
+		return err
 	}
 
 	defer func() {

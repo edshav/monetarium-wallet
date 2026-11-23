@@ -2401,7 +2401,12 @@ func (w *Wallet) purchaseTickets(ctx context.Context, op errors.Op,
 			// The ticket is already published. Keep publishing the
 			// rest; the wallet may retry the fee itself, or it can be
 			// paid with processunmanagedticket.
-			log.Errorf("VSP fee for published ticket %v failed: %v", ticketHash, err)
+			if errors.Is(err, errCatchingUp) {
+				// The fee job retries once the rescan finishes.
+				log.Infof("VSP fee for published ticket %v waits: %v", ticketHash, err)
+			} else {
+				log.Errorf("VSP fee for published ticket %v failed: %v", ticketHash, err)
+			}
 			feeErrs = append(feeErrs, errors.Errorf("ticket %v: %w", ticketHash, err))
 			continue
 		}

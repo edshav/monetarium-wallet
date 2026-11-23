@@ -69,6 +69,10 @@ func TestVSPPurchaseTicketsFeeInputs(t *testing.T) {
 		// fails the second ticket's publish, "cancel" cancels the request
 		// at the first fee address request.
 		stop string
+		// catchUp: at the first fee address request, a block connected
+		// without its txs, at another ticket price, prunes the ticket and
+		// leaves a rescan point, so the fee step waits for the rescan.
+		catchUp bool
 	}{
 		{name: "Process fails", feeAddrErr: types.ErrInternalError, feeFails: true},
 		{name: "fee tx not signed", lock: true, feeFails: true},
@@ -82,6 +86,9 @@ func TestVSPPurchaseTicketsFeeInputs(t *testing.T) {
 		// The first fee fails with errors.Locked, which must not become
 		// the stopped purchase's kind.
 		{name: "second ticket not published, wallet locked", lockAtPublish: true, feeFails: true, stop: "publish"},
+		// The fee tx is kept for the job's retry: it spends the reserved
+		// input, and nothing is paid.
+		{name: "ticket pruned during catch-up", catchUp: true, feeFails: true, wantSpent: true, tickets: 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
@@ -95,6 +102,7 @@ func TestVSPPurchaseTicketsFeeInputs(t *testing.T) {
 				reserved   map[outpoint]struct{}           // locked at the first fee address request
 				held       map[outpoint]struct{}           // locked by the concurrent purchase
 				paid       []*wire.MsgTx
+				prune      func()
 			)
 			// snapshot records the locked fee inputs; the caller holds mu.
 			snapshot := func() {
@@ -115,6 +123,9 @@ func TestVSPPurchaseTicketsFeeInputs(t *testing.T) {
 					}
 					if tc.stop == "cancel" {
 						cancel()
+					}
+					if tc.catchUp {
+						prune()
 					}
 				}
 				var req types.FeeAddressRequest
@@ -247,7 +258,27 @@ func TestVSPPurchaseTicketsFeeInputs(t *testing.T) {
 			}
 			mu.Lock()
 			c, feeAddr, attemptOps = vsp, addr.(Address), ops
+			prune = func() {
+				header := wire.BlockHeader{
+					PrevBlock: tip.BlockHash(),
+					Height:    tip.Height + 1,
+					Bits:      params.PowLimitBits,
+					SBits:     2e7,
+					VoteBits:  1,
+				}
+				filter, err := blockcf2.Regular(&wire.MsgBlock{Header: header}, nil)
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				hash := header.BlockHash()
+				_, err = w.ChainSwitch(ctx, &forest, []*BlockNode{NewBlockNode(&header, &hash, filter)}, nil)
+				if err != nil {
+					t.Error(err)
+				}
+			}
 			mu.Unlock()
+			walletLogs := testWalletLog(t)
 
 			var n NetworkBackend = mockNetwork{}
 			if tc.stop == "publish" {
@@ -328,6 +359,24 @@ func TestVSPPurchaseTicketsFeeInputs(t *testing.T) {
 			if len(resp.Tickets) != want {
 				t.Fatalf("%d tickets, want %d", len(resp.Tickets), want)
 			}
+			if tc.feeFails && !tc.catchUp && tc.stop == "" &&
+				!strings.Contains(walletLogs.String(), "[ERR] WLLT: VSP fee for published ticket") {
+				t.Errorf("the fee error is not logged as an error:\n%s", walletLogs)
+			}
+			if tc.catchUp {
+				if !errors.Is(err, ErrVSPFeeNotPaid) || !errors.Is(err, errCatchingUp) {
+					t.Errorf("PurchaseTickets: %v; want ErrVSPFeeNotPaid and errCatchingUp", err)
+				}
+				if strings.Contains(walletLogs.String(), "[ERR]") ||
+					!strings.Contains(walletLogs.String(), "[INF] WLLT: VSP fee for published ticket") {
+					t.Errorf("want the wait logged, and no error, while the wallet catches up:\n%s", walletLogs)
+				}
+				vsp.mu.Lock()
+				for _, fp := range vsp.jobs {
+					fp.stop()
+				}
+				vsp.mu.Unlock()
+			}
 
 			mu.Lock()
 			defer mu.Unlock()
@@ -361,6 +410,10 @@ func TestVSPPurchaseTicketsFeeInputs(t *testing.T) {
 				}
 			}
 			switch {
+			case tc.catchUp:
+				if len(paid) != 0 {
+					t.Errorf("%d fee txs paid while the wallet catches up, want none", len(paid))
+				}
 			case tc.wantSpent:
 				// A fee tx may also spend another output to top up.
 				for op := range reserved {
