@@ -319,8 +319,14 @@ func TestVSPPurchaseTicketsFeeInputs(t *testing.T) {
 					t.Errorf("%d tickets asked for a fee address, want at most the first", feeSteps)
 				}
 			}
-			if len(resp.Tickets) != buy {
-				t.Fatalf("%d tickets, want %d", len(resp.Tickets), buy)
+			// A stopped purchase reports only the first ticket, the one
+			// it published.
+			want := buy
+			if tc.stop != "" {
+				want = 1
+			}
+			if len(resp.Tickets) != want {
+				t.Fatalf("%d tickets, want %d", len(resp.Tickets), want)
 			}
 
 			mu.Lock()
