@@ -223,6 +223,27 @@ func (c *VSPClient) ProcessManagedTickets(ctx context.Context, tickets []*VSPTic
 			continue
 		}
 
+		// The fee tx the wallet recorded for the ticket, which recording
+		// the VSP's hash below would leave unreferenced.  Only this VSP's
+		// answer shows it does not hold that tx: one sent to another VSP
+		// is kept.  As in Process, a record without a host is this VSP's.
+		var ownHash chainhash.Hash
+		if info, err := ticket.VSPTicketInfo(ctx); err == nil &&
+			(info.Host == "" || SameVSPHost(info.Host, c.Client.URL)) {
+			ownHash = info.FeeHash
+		}
+		// abandonOwn abandons it once the VSP's fee hash is recorded, for a
+		// fee the VSP holds: received, broadcast or confirmed.  A fee
+		// payment job started meanwhile may hold it, but the VSP refuses
+		// it while it holds its own, and the wallet never broadcasts an
+		// unpublished fee tx itself.  A VSP whose fee errored would take
+		// it again.
+		abandonOwn := func(vspHash chainhash.Hash) {
+			if vspHash != (chainhash.Hash{}) && ownHash != vspHash {
+				c.abandonFeeTx(ctx, ticket, ownHash)
+			}
+		}
+
 		// Errors below are per ticket: collect them and keep going, or
 		// every later ticket would be skipped.
 		if status.FeeTxStatus == "confirmed" {
@@ -234,7 +255,9 @@ func (c *VSPClient) ProcessManagedTickets(ctx context.Context, tickets []*VSPTic
 			err = ticket.UpdateFeeConfirmed(ctx, *feeHash, c.Client.URL, c.Client.PubKey)
 			if err != nil {
 				errs = append(errs, errors.Errorf("ticket %v: record confirmed fee: %w", hash, err))
+				continue
 			}
+			abandonOwn(*feeHash)
 			continue
 		} else if status.FeeTxHash != "" {
 			feeHash, err := chainhash.NewHashFromStr(status.FeeTxHash)
@@ -246,6 +269,9 @@ func (c *VSPClient) ProcessManagedTickets(ctx context.Context, tickets []*VSPTic
 			if err != nil {
 				errs = append(errs, errors.Errorf("ticket %v: record paid fee: %w", hash, err))
 				continue
+			}
+			if status.FeeTxStatus == "received" || status.FeeTxStatus == "broadcast" {
+				abandonOwn(*feeHash)
 			}
 			_ = c.feePayment(ctx, ticket, true)
 		} else {

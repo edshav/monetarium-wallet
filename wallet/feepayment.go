@@ -20,6 +20,7 @@ import (
 	"github.com/monetarium/monetarium-node/txscript/stdaddr"
 	"github.com/monetarium/monetarium-node/wire"
 	"github.com/decred/vspd/types/v3"
+	"github.com/monetarium/monetarium-wallet/wallet/udb"
 	"github.com/monetarium/monetarium-wallet/wallet/walletdb"
 )
 
@@ -57,6 +58,11 @@ type vspFeePayment struct {
 	feeTx   *wire.MsgTx
 	state   State
 	err     error
+	// ownFeeHash is the last fee tx of the job's own that recordReceivedFee
+	// dropped.  It abandons it once the VSP's recorded fee tx is another
+	// one, on that call or a later one: the VSP replaces its fee tx only
+	// after the one it held errored.
+	ownFeeHash chainhash.Hash
 
 	timerMu sync.Mutex
 	timer   *time.Timer
@@ -96,36 +102,55 @@ func (fp *vspFeePayment) removedExpiredOrSpent() bool {
 	return false
 }
 
-// abandonFeeTx removes an unpublished fee tx from the wallet so its inputs can
-// be spent again.  A tx that is not held unpublished is left alone: the hash
-// may come from the VSP, and a tx the network may have must not be forgotten.
+// abandonFeeTx abandons the job's unpublished fee tx feeHash, as
+// VSPClient.abandonFeeTx does.
 func (fp *vspFeePayment) abandonFeeTx(feeHash chainhash.Hash) {
+	fp.client.abandonFeeTx(fp.ctx, fp.ticket, feeHash)
+}
+
+// abandonFeeTx removes the ticket's unpublished fee tx feeHash from the wallet
+// so its inputs can be spent again.  A tx that is not held unpublished is left
+// alone: the hash may come from the VSP, and a tx the network may have must
+// not be forgotten.  So is one another ticket's record names: a hash the VSP
+// named may be the fee tx of another of the wallet's tickets.
+func (c *VSPClient) abandonFeeTx(ctx context.Context, ticket *VSPTicket, feeHash chainhash.Hash) {
 	if feeHash == (chainhash.Hash{}) {
 		return
 	}
-	w := fp.client.wallet
-	var unpublished bool
-	err := walletdb.View(fp.ctx, w.db, func(dbtx walletdb.ReadTx) error {
+	w := c.wallet
+	var unpublished, otherTicket bool
+	err := walletdb.View(ctx, w.db, func(dbtx walletdb.ReadTx) error {
 		recs, err := w.txStore.UnminedTxs(dbtx)
+		if err != nil {
+			return err
+		}
 		for _, rec := range recs {
 			if rec.Hash == feeHash {
 				unpublished = rec.Unpublished
 				break
 			}
 		}
-		return err
+		if !unpublished {
+			return nil
+		}
+		return udb.ForEachVSPTicket(dbtx, func(h chainhash.Hash, t *udb.VSPTicket) error {
+			if h != *ticket.Hash() && t.FeeHash == feeHash {
+				otherTicket = true
+			}
+			return nil
+		})
 	})
-	if err != nil || !unpublished {
-		fp.client.log.Warnf("Ticket %v: not abandoning fee tx %v: unpublished %v, err %v",
-			fp.ticket, feeHash, unpublished, err)
+	if err != nil || !unpublished || otherTicket {
+		c.log.Warnf("Ticket %v: not abandoning fee tx %v: unpublished %v, "+
+			"another ticket's %v, err %v", ticket, feeHash, unpublished, otherTicket, err)
 		return
 	}
-	err = w.AbandonTransaction(fp.ctx, &feeHash)
+	err = w.AbandonTransaction(ctx, &feeHash)
 	if err != nil {
-		fp.client.log.Errorf("Ticket %v: abandon fee tx %v: %v", fp.ticket, feeHash, err)
+		c.log.Errorf("Ticket %v: abandon fee tx %v: %v", ticket, feeHash, err)
 		return
 	}
-	fp.client.log.Infof("Ticket %v: abandoned fee tx %v", fp.ticket, feeHash)
+	c.log.Infof("Ticket %v: abandoned fee tx %v", ticket, feeHash)
 }
 
 func (fp *vspFeePayment) remove(reason string) {
@@ -600,17 +625,19 @@ func isFeeAlreadyReceived(err error) bool {
 // ErrFeeAlreadyReceived once it holds a fee tx, for example one paid before the
 // wallet was restored from seed.  The job stops using its own fee tx and fee
 // quote, so a retry asks the VSP again.  Once the VSP names its fee tx, a
-// finished fee tx the job holds that is not that one is abandoned if unpublished.
+// finished fee tx the job holds, or the one an earlier call dropped and kept
+// in ownFeeHash, is abandoned if it is not that one and is unpublished.
 func (fp *vspFeePayment) recordReceivedFee() error {
 	ctx := fp.ctx
 
 	fp.mu.Lock()
-	// The job's fee tx, if it holds one.  Not fp.feeHash, which an earlier
-	// reply may have set to a hash the VSP named.
-	var ownHash chainhash.Hash
+	// The job's fee tx, if it holds one, or the one an earlier call
+	// dropped before it could record the VSP's.  Not fp.feeHash, which an
+	// earlier reply may have set to a hash the VSP named.
 	if fp.feeTx != nil && len(fp.feeTx.TxOut) != 0 {
-		ownHash = fp.feeTx.TxHash()
+		fp.ownFeeHash = fp.feeTx.TxHash()
 	}
+	ownHash := fp.ownFeeHash
 	fp.feeTx = nil
 	fp.fee = 0
 	fp.mu.Unlock()
@@ -635,8 +662,8 @@ func (fp *vspFeePayment) recordReceivedFee() error {
 	}
 	if ownHash != *feeHash {
 		// The job's fee tx will never be paid; abandoning it frees its
-		// inputs.  abandonFeeTx skips a zero hash, a published tx and a
-		// tx the wallet does not hold.
+		// inputs.  abandonFeeTx skips a zero hash, a published tx, a tx
+		// the wallet does not hold and one another ticket's record names.
 		fp.abandonFeeTx(ownHash)
 	}
 	return fp.confirmPayment()
