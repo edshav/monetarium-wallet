@@ -1841,6 +1841,21 @@ func ExistsUnpublished(ns walletdb.ReadBucket, hash *chainhash.Hash) bool {
 	return existsUnpublished(ns, hash[:])
 }
 
+// UnpublishedHashes returns the hashes of the txs recorded as unpublished.
+func UnpublishedHashes(ns walletdb.ReadBucket) ([]chainhash.Hash, error) {
+	var hashes []chainhash.Hash
+	err := ns.NestedReadBucket(bucketUnpublished).ForEach(func(k, v []byte) error {
+		if len(k) == chainhash.HashSize && len(v) == 1 && v[0] != 0 {
+			hashes = append(hashes, chainhash.Hash(k))
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, errors.E(errors.IO, err)
+	}
+	return hashes, nil
+}
+
 func deleteUnpublished(ns walletdb.ReadWriteBucket, k []byte) error {
 	err := ns.NestedReadWriteBucket(bucketUnpublished).Delete(k)
 	if err != nil {
