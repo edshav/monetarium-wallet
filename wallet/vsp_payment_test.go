@@ -40,7 +40,11 @@ type vspPaymentFixture struct {
 	tip     wire.BlockHeader
 	n       byte
 	feeAcct uint32
-	sbits   int64 // the ticket price in the headers of mined outputs' blocks
+	// sbits is the ticket price in the headers of mined outputs' blocks.  Left 0
+	// past height CoinbaseMaturity+1, the next price is 0 too, which keeps every
+	// unmined ticket.
+	sbits    int64
+	poolSize uint32 // the ticket pool size in those headers
 }
 
 func newVSPPaymentFixture(ctx context.Context, t *testing.T) *vspPaymentFixture {
@@ -100,6 +104,7 @@ func (f *vspPaymentFixture) mine(ctx context.Context, t *testing.T, txs ...*wire
 		Height:    f.tip.Height + 1,
 		Bits:      f.cfg.Params.PowLimitBits,
 		SBits:     f.sbits,
+		PoolSize:  f.poolSize,
 		VoteBits:  1, // approve the previous block, or its outputs are invalidated
 	}
 	filter, err := blockcf2.Regular(&wire.MsgBlock{Header: header}, nil)

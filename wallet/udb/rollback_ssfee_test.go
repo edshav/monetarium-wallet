@@ -135,7 +135,7 @@ func testPruneUnminedRemovesDetachedSSFee(t *testing.T, remine bool) {
 			return err
 		}
 		if remine {
-			early, err := s.PruneUnmined(dbtx, 0, false)
+			early, err := s.PruneUnmined(dbtx, 0, 0, false)
 			if err != nil {
 				return err
 			}
@@ -156,7 +156,7 @@ func testPruneUnminedRemovesDetachedSSFee(t *testing.T, remine bool) {
 				return err
 			}
 		}
-		pruned, err = s.PruneUnmined(dbtx, 0, true)
+		pruned, err = s.PruneUnmined(dbtx, 0, 0, true)
 		return err
 	})
 	if err != nil {

@@ -231,16 +231,26 @@ func (w *Wallet) ChainSwitch(ctx context.Context, forest *SidechainForest, chain
 		// Prune unmined transactions that don't belong on the extended chain.
 		// An error here is not fatal and should just be logged.
 		//
-		// TODO: The stake difficulty passed here is not correct.  This must be
-		// the difficulty of the next block, not the tip block.
-		//
 		// An SSFee mined again in the new chain is still unmined until the
 		// transactions of every main chain block are recorded, that is
 		// until there is no rescan point.
 		rescanPoint, rescanErr := w.rescanPoint(dbtx)
 		pruneSSFee := rescanErr == nil && rescanPoint == nil
 		tip := chain[len(chain)-1]
-		hashes, err := w.txStore.PruneUnmined(dbtx, tip.Header.SBits, pruneSSFee)
+		// With the next block's ticket price unknown, no ticket is pruned
+		// for its price.
+		var nextSDiff dcrutil.Amount
+		var sdiffErr error
+		if !deployments.DCP0001.Active(int32(tip.Header.Height), w.chainParams.Net) {
+			sdiffErr = errors.E(errors.Deployment, "DCP0001 is not known to be active")
+		} else {
+			nextSDiff, sdiffErr = w.nextRequiredDCP0001PoSDifficulty(dbtx, tip.Header, nil)
+		}
+		if sdiffErr != nil {
+			log.Errorf("Unable to prune unmined tickets: next ticket price is unknown: %v", sdiffErr)
+			nextSDiff = 0
+		}
+		hashes, err := w.txStore.PruneUnmined(dbtx, tip.Header.SBits, int64(nextSDiff), pruneSSFee)
 		if err != nil {
 			log.Errorf("Failed to prune unmined transactions when "+
 				"connecting block height %v: %v", tip.Header.Height, err)

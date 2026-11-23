@@ -357,8 +357,8 @@ func (s *Store) unminedTxHashes(ns walletdb.ReadBucket) ([]*chainhash.Hash, erro
 // unmined tx set.  This includes:
 //
 //   - Any transactions past a set expiry
-//   - Ticket purchases with a different ticket price than the passed stake
-//     difficulty
+//   - Ticket purchases whose price is neither tipSDiff, the tip's ticket price,
+//     nor nextSDiff, the next block's; none when nextSDiff is 0 (unknown)
 //   - Votes that do not vote on the tip block
 //   - Regular transactions whose inputs have been double-spent on chain
 //     (e.g., after a reorg where the transaction was orphaned)
@@ -368,7 +368,10 @@ func (s *Store) unminedTxHashes(ns walletdb.ReadBucket) ([]*chainhash.Hash, erro
 // mempool.  Pass pruneSSFee only when the transactions of the attached blocks
 // have been recorded, because an SSFee mined again in them is otherwise still
 // unmined.
-func (s *Store) PruneUnmined(dbtx walletdb.ReadWriteTx, stakeDiff int64, pruneSSFee bool) ([]*chainhash.Hash, error) {
+//
+// A ticket at the next block's price may be mined in the next block, and one
+// at the tip's price in a block that replaces the tip, so both are kept.
+func (s *Store) PruneUnmined(dbtx walletdb.ReadWriteTx, tipSDiff, nextSDiff int64, pruneSSFee bool) ([]*chainhash.Hash, error) {
 	ns := dbtx.ReadWriteBucket(wtxmgrBucketKey)
 
 	tipHash, tipHeight := s.MainChainTip(dbtx)
@@ -394,7 +397,8 @@ func (s *Store) PruneUnmined(dbtx walletdb.ReadWriteTx, stakeDiff int64, pruneSS
 		case tx.Expiry != wire.NoExpiryValue && tx.Expiry <= uint32(tipHeight):
 			reason = "expired"
 		case stake.IsSStx(&tx):
-			if tx.TxOut[0].Value == stakeDiff {
+			price := tx.TxOut[0].Value
+			if nextSDiff == 0 || price == nextSDiff || price == tipSDiff {
 				continue
 			}
 			reason = "outdated ticket purchase"

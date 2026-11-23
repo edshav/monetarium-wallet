@@ -110,7 +110,7 @@ func TestRollbackRestoresSpentSKACredit(t *testing.T) {
 		if err := s.Rollback(dbtx, 2); err != nil {
 			return err
 		}
-		pruned, err = s.PruneUnmined(dbtx, 0, true)
+		pruned, err = s.PruneUnmined(dbtx, 0, 0, true)
 		return err
 	})
 	if err != nil {

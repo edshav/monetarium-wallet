@@ -55,6 +55,7 @@ func (f *vspPaymentFixture) mineEmpty(ctx context.Context, t *testing.T, n int) 
 			Height:    f.tip.Height + 1,
 			Bits:      f.cfg.Params.PowLimitBits,
 			SBits:     f.sbits,
+			PoolSize:  f.poolSize,
 			VoteBits:  1,
 		}
 		filter, err := blockcf2.Regular(&wire.MsgBlock{Header: header}, nil)
